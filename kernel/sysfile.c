@@ -503,3 +503,32 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_msgget(void){
+  int id;
+  argint(0, &id);
+  return msgget(id);
+}
+
+uint64
+sys_msgsnd(void){
+  int mqid;
+  uint64 msg;
+  int msgsz;
+  argint(0, &mqid);
+  argaddr(1, &msg);
+  argint(2, &msgsz);
+  return msgsnd(mqid, msg, msgsz);
+}
+
+uint64
+sys_msgrcv(void){
+  int mqid;
+  uint64 msg;
+  int msgsz;
+  argint(0, &mqid);
+  argaddr(1, &msg);
+  argint(2, &msgsz);
+  return msgrcv(mqid, msg, msgsz);
+}
