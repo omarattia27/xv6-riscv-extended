@@ -162,7 +162,15 @@ found:
 // p->lock must be held.
 static void
 freeproc(struct proc *p)
-{
+{ // deallocate user pages.
+  // decrement reference counts on physical pages
+  //def decrement_refcount_deallocate():
+    // for PTE in PT:
+    //   if pa=PE2PA(PTE) != 0:
+    //     refcount[pa/PGSIZE]--
+    //     if refcount[pa/PGSIZE]==0:
+    //       freepa(pa)
+  decrement_refcount_deallocate(p->pagetable, p->sz);
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -280,8 +288,8 @@ kfork(void)
     return -1;
   }
 
-  // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  // Copy-on-write: share parent's memory with child
+  if(uvmcow_copy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -369,6 +377,8 @@ kexit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  //free PTEs and physical memory
+  //proc_freepagetable(p->pagetable, p->sz);
 
   release(&wait_lock);
 

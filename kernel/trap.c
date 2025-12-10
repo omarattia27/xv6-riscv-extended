@@ -6,6 +6,11 @@
 #include "proc.h"
 #include "defs.h"
 
+#define COW_CAUSE 15
+
+extern int refcount[PHYSTOP/PGSIZE];
+extern struct spinlock refcount_lock; 
+
 struct spinlock tickslock;
 uint ticks;
 
@@ -68,10 +73,46 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == COW_CAUSE){  // handle copy-on-write page fault
+    // handle other exceptions here.  
+    // if (was COW page && page fault is write -> perform COW)
+    //   handle COW
+    pte_t *pte = walk(p->pagetable, r_stval(), 0);
+
+    if(pte && (*pte & PTE_V) && !(*pte & PTE_W) && (*pte & PTE_U)) {
+      uint64 pa = PTE2PA(*pte);
+      
+      acquire(&refcount_lock);
+      int refs = refcount[pa/PGSIZE];
+      release(&refcount_lock);
+      
+      if(refs > 1) {
+        // allocate new page
+        uint64 mem = (uint64) kalloc();
+        if(mem == 0) {
+          setkilled(p);
+          return 0;
+        }
+        // copy data from old page to new page
+        memmove((void*)mem, (void*)pa, PGSIZE);
+        // update PTE to point to new page
+        *pte = PA2PTE(mem) | PTE_FLAGS(*pte) | PTE_W;
+        // decrement refcount of old page
+        acquire(&refcount_lock);
+        refcount[pa/PGSIZE]--;
+        release(&refcount_lock);
+      } else {
+        // only one reference, can just make it writable
+        *pte |= PTE_W;
+      }
+      sfence_vma();
+    } 
+
   } else if((r_scause() == 15 || r_scause() == 13) &&
             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
     // page fault on lazily-allocated page
-  } else {
+  } 
+  else{
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
