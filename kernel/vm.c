@@ -13,6 +13,9 @@
  */
 pagetable_t kernel_pagetable;
 
+extern int refcount[PHYSTOP/PGSIZE];  // reference count array defined in kalloc.c
+extern struct spinlock refcount_lock;   // reference count lock defined in kalloc.c
+
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
@@ -283,9 +286,89 @@ void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);  // do_free=0 because COW manages refcounts
   freewalk(pagetable);
 }
+
+// for PTE in PT:
+//   if pa=PE2PA(PTE) != 0:
+//     refcount[pa/PGSIZE]--
+//     if refcount[pa/PGSIZE]==0:
+//       freepa(pa)
+int 
+decrement_refcount_deallocate(pagetable_t pgt, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(pgt, i, 0)) == 0)
+      continue;   // page table entry hasn't been allocated
+    
+    if((*pte & PTE_V) == 0)
+      continue;   // physical page hasn't been allocated
+
+    pa = PTE2PA(*pte);
+
+    acquire(&refcount_lock);
+    refcount[pa/PGSIZE]--;
+    int should_free = (refcount[pa/PGSIZE] == 0);
+    release(&refcount_lock);
+
+    if(should_free)
+      kfree((void*)pa);
+  }
+  return 0;
+}
+
+//int vmfault(pagetable_t pagetable, uint64 va, int perm);
+
+// for PTE in PT:
+//   if pa=PE2PA(PTE) != 0:
+//     increment refcount[pa/PGSIZE]
+//     set PTE to read-only (remove W flag)
+// Returns 0 on success, -1 on failure.
+    
+int 
+uvmcow_copy(pagetable_t old, pagetable_t new, uint64 sz){
+  pte_t *pte;
+  uint64 pa, i, flags;
+  
+  for(i = 0; i < sz; i += PGSIZE){
+    // Get parent's PTE
+    if((pte = walk(old, i, 0)) == 0)
+      continue;   // page table entry hasn't been allocated
+    
+    if((*pte & PTE_V) == 0)
+      continue;   // physical page hasn't been allocated
+    
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    
+    // Mark parent's page read-only
+    *pte = (*pte) & (~PTE_W);
+    
+    // Map child to same physical page, read-only
+    if(mappages(new, i, PGSIZE, pa, (flags & ~PTE_W)) != 0)
+      goto err;
+    
+    // Increment refcount for shared page
+    acquire(&refcount_lock);
+    refcount[pa/PGSIZE]++;
+    release(&refcount_lock);
+  }
+  
+  // Flush TLB since we modified parent's PTEs
+  sfence_vma();
+  
+  return 0;
+
+err:
+  // On error, unmap child pages but don't free physical memory
+  uvmunmap(new, 0, i / PGSIZE, 0);
+  return -1;
+}
+
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.

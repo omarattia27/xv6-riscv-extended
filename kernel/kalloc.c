@@ -9,6 +9,11 @@
 #include "riscv.h"
 #include "defs.h"
 
+// reference count per physical page where the index is the physical page number
+int refcount[PHYSTOP/PGSIZE];
+struct spinlock refcount_lock; 
+
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -27,6 +32,9 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&refcount_lock, "refcount");
+  for(int i = 0; i < PHYSTOP/PGSIZE; i++)
+    refcount[i] = 0;
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -51,6 +59,20 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  acquire(&refcount_lock);
+  // If refcount is 0, this is initial free during boot, set to 1 then free
+  if(refcount[(uint64)pa/PGSIZE] == 0) {
+    refcount[(uint64)pa/PGSIZE] = 1;
+  }
+  
+  if(refcount[(uint64)pa/PGSIZE] > 1) {
+    refcount[(uint64)pa/PGSIZE]--;
+    release(&refcount_lock);
+    return;  // Don't free yet
+  }
+  refcount[(uint64)pa/PGSIZE] = 0;
+  release(&refcount_lock);
+  
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -76,7 +98,12 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
+    // Initialize refcount to 1 for newly allocated page
+    acquire(&refcount_lock);
+    refcount[(uint64)r/PGSIZE] = 1;
+    release(&refcount_lock);
+  }
   return (void*)r;
 }
