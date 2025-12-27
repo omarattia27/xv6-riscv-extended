@@ -170,6 +170,7 @@ freeproc(struct proc *p)
     //     refcount[pa/PGSIZE]--
     //     if refcount[pa/PGSIZE]==0:
     //       freepa(pa)
+  // printf("[DEBUG] freeproc: pid=%d sz=0x%lx\n", p->pid, p->sz);
   decrement_refcount_deallocate(p->pagetable, p->sz);
   if(p->trapframe)
     kfree((void*)p->trapframe);
@@ -264,6 +265,8 @@ growproc(int n)
     if(sz + n > TRAPFRAME) {
       return -1;
     }
+    // growproc() always allocates eagerly
+    // Lazy allocation is handled in sys_sbrk() by skipping growproc()
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
     }

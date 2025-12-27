@@ -147,6 +147,7 @@ UPROGS=\
 	$U/_schedtest\
 	$U/_queue\
 	$U/_cowtest\
+	$U/_testboth\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

@@ -7,6 +7,7 @@
 #include "kernel/syscall.h"
 #include "kernel/memlayout.h"
 #include "kernel/riscv.h"
+#include "kernel/vm.h"
 
 //
 // Tests xv6 system calls.  usertests without arguments runs them all
@@ -83,35 +84,47 @@ copyout(char *s)
   for(int ai = 0; ai < sizeof(addrs)/sizeof(addrs[0]); ai++){
     uint64 addr = addrs[ai];
 
+    printf("copyout: testing addr %p [%d/%lu]\n", (void*)addr, ai+1, sizeof(addrs)/sizeof(addrs[0]));
+
+    printf("  opening README...\n");
     int fd = open("README", 0);
     if(fd < 0){
       printf("open(README) failed\n");
       exit(1);
     }
+    printf("  reading from file to addr %p...\n", (void*)addr);
     int n = read(fd, (void*)addr, 8192);
+    printf("  read returned %d\n", n);
     if(n > 0){
       printf("read(fd, %p, 8192) returned %d, not -1 or 0\n", (void*)addr, n);
       exit(1);
     }
     close(fd);
+    printf("  file test done\n");
 
+    printf("  creating pipe...\n");
     int fds[2];
     if(pipe(fds) < 0){
       printf("pipe() failed\n");
       exit(1);
     }
+    printf("  writing to pipe...\n");
     n = write(fds[1], "x", 1);
     if(n != 1){
       printf("pipe write failed\n");
       exit(1);
     }
+    printf("  reading from pipe to addr %p...\n", (void*)addr);
     n = read(fds[0], (void*)addr, 8192);
+    printf("  pipe read returned %d\n", n);
     if(n > 0){
       printf("read(pipe, %p, 8192) returned %d, not -1 or 0\n", (void*)addr, n);
       exit(1);
     }
     close(fds[0]);
     close(fds[1]);
+    printf("  pipe test done\n");
+    printf("copyout: addr %p PASSED\n\n", (void*)addr);
   }
 }
 
@@ -2594,9 +2607,9 @@ lazy_alloc(char *s)
 {
   char *i, *prev_end, *new_end;
   
-  prev_end = sbrklazy(REGION_SZ);
+  prev_end = sys_sbrk(REGION_SZ, SBRK_LAZY);
   if (prev_end == (char *) SBRK_ERROR) {
-    printf("sbrklazy() failed\n");
+    printf("sbrk() failed\n");
     exit(1);
   }
   new_end = prev_end + REGION_SZ;
@@ -2623,9 +2636,9 @@ lazy_unmap(char *s)
   int pid;
   char *i, *prev_end, *new_end;
 
-  prev_end = sbrklazy(REGION_SZ);
+  prev_end = sys_sbrk(REGION_SZ, SBRK_LAZY);
   if (prev_end == (char*)SBRK_ERROR) {
-    printf("sbrklazy() failed\n");
+    printf("sbrk() failed\n");
     exit(1);
   }
   new_end = prev_end + REGION_SZ;
@@ -2639,7 +2652,7 @@ lazy_unmap(char *s)
       printf("error forking\n");
       exit(1);
     } else if (pid == 0) {
-      sbrklazy(-1L * REGION_SZ);
+      sbrk(-1L * REGION_SZ);
       *(char **)i = i;
       exit(0);
     } else {
@@ -2661,7 +2674,7 @@ lazy_copy(char *s)
   // copyinstr on lazy page
   {
     char *p = sbrk(0);
-    sbrklazy(4*PGSIZE);
+    sbrk(4*PGSIZE);
     open(p + 8192, 0);
   }
   
@@ -2704,24 +2717,24 @@ lazy_sbrk(char *s)
   // sbrk() takes just int, so take 2^30-sized steps towards MAXVA
   char *p = sbrk(0);
   while ((uint64)p < MAXVA-(1<<30)) {
-    p = sbrklazy(1<<30);
+    p = sys_sbrk(1<<30, SBRK_LAZY);
     if (p < 0) {
-      printf("sbrklazy(%d) returned %p\n", 1<<30, p);
+      printf("sbrk(%d) returned %p\n", 1<<30, p);
       exit(1);
     }
 
-    p = sbrklazy(0);
+    p = sbrk(0);
   }
 
   int n = TRAPFRAME-PGSIZE-(uint64)p;
 
-  char *p1 = sbrklazy(n);
+  char *p1 = sys_sbrk(n, SBRK_LAZY);
   if (p1 < 0 || p1 != p) {
-    printf("sbrklazy(%d) returned %p, not expected %p\n", n, p1, p);
+    printf("sbrk(%d) returned %p, not expected %p\n", n, p1, p);
     exit(1);
   }
 
-  p = sbrk(PGSIZE);
+  p = sys_sbrk(PGSIZE, SBRK_LAZY);
   if (p < 0 || (uint64)p != TRAPFRAME-PGSIZE) {
     printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
     exit(1);
@@ -2739,9 +2752,9 @@ lazy_sbrk(char *s)
     exit(1);
   }
 
-  p = sbrklazy(1);
+  p = sbrk(1);
   if ((uint64)p != -1) {
-    printf("sbrklazy(1) returned %p, expected error\n", p);
+    printf("sbrk(1) returned %p, expected error\n", p);
     exit(1);
   }
 

@@ -11,6 +11,11 @@
 extern int refcount[PHYSTOP/PGSIZE];
 extern struct spinlock refcount_lock; 
 
+// Debug counters
+int cow_faults_copy = 0;    // COW faults that required copying
+int cow_faults_promote = 0; // COW faults with refcount=1 (just make writable)
+int lazy_alloc_faults = 0;  // Lazy allocation faults
+
 struct spinlock tickslock;
 uint ticks;
 
@@ -73,13 +78,21 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if(r_scause() == COW_CAUSE){  // handle copy-on-write page fault
-    // handle other exceptions here.  
-    // if (was COW page && page fault is write -> perform COW)
-    //   handle COW
-    pte_t *pte = walk(p->pagetable, r_stval(), 0);
+  } else if(r_scause() == 15){  // handle copy-on-write page fault
+    uint64 va = r_stval();
+    
+    // Check if address is valid (reject page 0 for null pointer safety)
+    if(va < PGSIZE || va >= p->sz || va >= MAXVA) {
+      printf("COW page fault: invalid address 0x%lx (sz=0x%lx)\n", va, p->sz);
+      setkilled(p);
+      goto killed;
+    }
+    
+    // Check if this is a COW page (valid, read-only, user page)
+    pte_t *pte = walk(p->pagetable, va, 0);
 
     if(pte && (*pte & PTE_V) && !(*pte & PTE_W) && (*pte & PTE_U)) {
+      // This is a COW page fault
       uint64 pa = PTE2PA(*pte);
       
       acquire(&refcount_lock);
@@ -101,23 +114,49 @@ usertrap(void)
         acquire(&refcount_lock);
         refcount[pa/PGSIZE]--;
         release(&refcount_lock);
+        cow_faults_copy++;
+        // printf("[COW] pid=%d copied page (refcount was %d) total_copy=%d\n", p->pid, refs, cow_faults_copy);
       } else {
         // only one reference, can just make it writable
         *pte |= PTE_W;
+        cow_faults_promote++;
+        // printf("[COW] pid=%d promoted page to writable (refcount=1) total_promote=%d\n", p->pid, cow_faults_promote);
       }
       sfence_vma();
-    } 
-
-  } else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
-  } 
+    } else if(vmfault(p->pagetable, r_stval(), 0) == 0) {
+      // Not a COW page, and vmfault failed - can't handle this
+      printf("usertrap(): unhandled page fault scause 0x%lx pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    } else {
+      // vmfault succeeded, lazy allocation handled it
+      lazy_alloc_faults++;
+      // printf("[LAZY] pid=%d allocated page on demand, total=%d\n", p->pid, lazy_alloc_faults);
+    }
+  } else if(r_scause() == 13) {
+    // Load page fault - try lazy allocation
+    if(vmfault(p->pagetable, r_stval(), 1) == 0) {
+      // vmfault failed - invalid address
+      printf("usertrap(): load page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
+  } else if(r_scause() == 12) {
+    // Instruction page fault - try lazy allocation
+    if(vmfault(p->pagetable, r_stval(), 1) == 0) {
+      // vmfault failed - invalid address  
+      printf("usertrap(): instruction page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    }
+  }
   else{
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
 
+killed:
   if(killed(p))
     kexit(-1);
 

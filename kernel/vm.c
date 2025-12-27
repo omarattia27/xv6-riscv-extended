@@ -254,6 +254,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    // printf("[DEBUG] uvmdealloc: freeing %d pages from 0x%lx to 0x%lx\n", npages, PGROUNDUP(newsz), PGROUNDUP(oldsz));
     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
   }
 
@@ -286,7 +287,7 @@ void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);  // do_free=0 because COW manages refcounts
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);  // do_free=0 because decrement_refcount_deallocate handles it
   freewalk(pagetable);
 }
 
@@ -345,6 +346,17 @@ uvmcow_copy(pagetable_t old, pagetable_t new, uint64 sz){
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     
+    // Executable pages are read-only code - share them with refcount tracking
+    if(flags & PTE_X) {
+      if(mappages(new, i, PGSIZE, pa, flags) != 0)
+        goto err;
+      acquire(&refcount_lock);
+      refcount[pa/PGSIZE]++;
+      release(&refcount_lock);
+      continue;
+    }
+    
+    // For writable data pages, mark both parent and child read-only for COW
     // Mark parent's page read-only
     *pte = (*pte) & (~PTE_W);
     
@@ -364,7 +376,20 @@ uvmcow_copy(pagetable_t old, pagetable_t new, uint64 sz){
   return 0;
 
 err:
-  // On error, unmap child pages but don't free physical memory
+  // On error, need to undo refcount increments and unmap child pages
+  // Walk through all pages we successfully mapped and decrement their refcounts
+  for(uint64 j = 0; j < i; j += PGSIZE) {
+    pte_t *err_pte = walk(new, j, 0);
+    if(err_pte && (*err_pte & PTE_V)) {
+      uint64 err_pa = PTE2PA(*err_pte);
+      acquire(&refcount_lock);
+      if(refcount[err_pa/PGSIZE] > 0) {
+        refcount[err_pa/PGSIZE]--;
+      }
+      release(&refcount_lock);
+    }
+  }
+  // Now unmap the pages (don't free since parent still uses them)
   uvmunmap(new, 0, i / PGSIZE, 0);
   return -1;
 }
@@ -430,20 +455,71 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    if(va0 >= MAXVA)
+    
+    if(va0 >= MAXVA) {
       return -1;
+    }
   
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+    pte = walk(pagetable, va0, 0);
+    
+    // Check if this is a COW page (valid, read-only, user)
+    // COW pages are writable pages that were made read-only for sharing
+    // Don't treat executable-only pages as COW
+    if(pte && (*pte & PTE_V) && !(*pte & PTE_W) && (*pte & PTE_U) && !(*pte & PTE_X)) {
+      // This is a COW page - handle it
+      uint64 pa = PTE2PA(*pte);
+      
+      acquire(&refcount_lock);
+      int refs = refcount[pa/PGSIZE];
+      release(&refcount_lock);
+      
+      // Only handle as COW if refcount > 0 (page is actually shared)
+      if(refs > 0) {
+        if(refs > 1) {
+          // Need to copy the page
+          char *mem = kalloc();
+          if(mem == 0) {
+            printf("copyout: kalloc failed\n");
+            return -1;
+          }
+          memmove(mem, (char*)pa, PGSIZE);
+          
+          // Update PTE
+          uint64 flags = PTE_FLAGS(*pte);
+          *pte = PA2PTE((uint64)mem) | flags | PTE_W;
+          
+          // Decrement old refcount
+          acquire(&refcount_lock);
+          refcount[pa/PGSIZE]--;
+          release(&refcount_lock);
+          
+          sfence_vma();
+        } else {
+          // Just make it writable
+          *pte |= PTE_W;
+          sfence_vma();
+        }
+      } else {
+        // refcount is 0, this is not a COW page, it's just read-only
+        // Trying to write to it should fail
+        printf("copyout: attempt to write to non-COW read-only page at va=0x%lx\n", va0);
         return -1;
       }
     }
-
-    pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
+    
+    // Now get the physical address (COW already handled above)
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0) {
+      printf("copyout: walkaddr returned 0 for va=0x%lx\n", va0);
       return -1;
+    }
+    
+    // Verify page is now writable
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0 || !(*pte & PTE_W)) {
+      printf("copyout: page not writable after COW, pte=%p, flags=0x%lx\n", pte, pte ? *pte : 0);
+      return -1;
+    }
       
     n = PGSIZE - (dstva - va0);
     if(n > len)
@@ -455,7 +531,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     dstva = va0 + PGSIZE;
   }
   return 0;
-}
+}  
 
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
@@ -464,9 +540,16 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
+  struct proc *p = myproc();
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
+    
+    // Check bounds first - don't try vmfault on obviously invalid addresses
+    if(va0 >= p->sz || va0 >= MAXVA) {
+      return -1;
+    }
+    
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
       if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
@@ -537,6 +620,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
   struct proc *p = myproc();
+  static int lazy_alloc_count = 0;
 
   if (va >= p->sz)
     return 0;
@@ -552,6 +636,12 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
     kfree((void *)mem);
     return 0;
   }
+  
+  lazy_alloc_count++;
+  if(lazy_alloc_count % 100 == 0) {
+    printf("vmfault: allocated %d pages lazily\n", lazy_alloc_count);
+  }
+  
   return mem;
 }
 
