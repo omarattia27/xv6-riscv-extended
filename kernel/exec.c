@@ -28,7 +28,7 @@ kexec(char *path, char **argv)
 {
   char *s, *last;
   int i, off;
-  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+  uint64 argc, sz = 0, sp, sp2, sp3, ustack[MAXARG], stackbase, stackbase2, stackbase3;
   struct elfhdr elf;
   struct inode *ip;
   struct proghdr ph;
@@ -85,13 +85,40 @@ kexec(char *path, char **argv)
   // Make the first inaccessible as a stack guard.
   // Use the rest as the user stack.
   sz = PGROUNDUP(sz);
-  uint64 sz1;
-  if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+  uint64 sz11;
+  if((sz11 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
     goto bad;
-  sz = sz1;
+  sz = sz11;
   uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
   sp = sz;
   stackbase = sp - USERSTACK*PGSIZE;
+
+  //SECOND STACK for optional thread library
+  // Allocate some pages at the next page boundary.
+  // Make the first inaccessible as a stack guard.
+  // Use the rest as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz2;
+  if((sz2 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+    goto bad;
+  sz = sz2;
+  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  sp2 = sz;
+  stackbase2 = sp2 - USERSTACK*PGSIZE;
+
+
+  //THIRD STACK for optional thread library
+  // Allocate some pages at the next page boundary.
+  // Make the first inaccessible as a stack guard.
+  // Use the rest as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz3;
+  if((sz3 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+    goto bad;
+  sz = sz3;
+  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  sp3 = sz; 
+  stackbase3 = sp3 - USERSTACK*PGSIZE;
 
   // Copy argument strings into new stack, remember their
   // addresses in ustack[].
@@ -132,8 +159,55 @@ kexec(char *path, char **argv)
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
-  p->trapframe->sp = sp; // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
+  p->trapframe->sp = sp; // initialdpagetable, oldsz);
+
+  // Store stack bases for each thread
+  p->threads[0]->stack_base = stackbase;
+  p->threads[1]->stack_base = stackbase2; 
+  p->threads[2]->stack_base = stackbase3;
+
+  // Check an address in the middle of each stack
+
+  // stackbase  16384 the limit on the stack growth
+  // sz1 should be 20480
+  // sp  should be 20448
+
+  // stackbase2 24576 the limit on the stack growth
+  // sz2 and sp2 should be 28672
+
+  // stackbase3 32768 the limit on the stack growth
+  // sz3 and sp3 should be 36864
+
+  int all_writable = 1;
+  for (int j = 0; j < 3; j++) {
+      uint64 stackbase_check, sp_check;
+      if (j == 0) { stackbase_check = stackbase; sp_check = sp; }
+      else if (j == 1) { stackbase_check = stackbase2; sp_check = sp2; }
+      else { stackbase_check = stackbase3; sp_check = sp3; }
+      
+      uint64 test_va = stackbase_check + PGSIZE/2; // One page above base
+      pte_t *pte = walk(p->pagetable, test_va, 0);
+      int is_valid = (pte && (*pte & PTE_V));
+      int is_user = (pte && (*pte & PTE_U));
+      int is_writable = (pte && (*pte & PTE_W));
+      
+      printf("Stack %d: va=0x%lx pte=%p flags=0x%lx (V=%d U=%d W=%d)\n", 
+            j, test_va, pte, pte ? *pte : 0, is_valid, is_user, is_writable);
+      
+      if (!pte || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+        all_writable = 0;
+        printf("  Stack %d is NOT valid/user-accessible\n", j);
+      } else if ((*pte & PTE_W) == 0) {
+        all_writable = 0;
+        printf("  Stack %d is NOT writable\n", j);
+      }
+  }
+  
+  if (all_writable) {
+    printf("All stacks are user-writable!\n");
+  } else {
+    printf("WARNING: Not all stacks are user-writable\n");
+  }
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

@@ -57,6 +57,11 @@ usertrap(void)
   w_stvec((uint64)kernelvec);  //DOC: kernelvec
 
   struct proc *p = myproc();
+  struct thread *t = mythread();
+  
+  // Sanity check: we should always have a valid thread in usertrap
+  if(t == 0)
+    panic("usertrap: no thread");
   
   // save user program counter.
   p->trapframe->epc = r_sepc();
@@ -64,7 +69,7 @@ usertrap(void)
   if(r_scause() == 8){
     // system call
 
-    if(killed(p))
+    if(killed_thread(t))
       kexit(-1);
 
     // sepc points to the ecall instruction,
@@ -84,7 +89,7 @@ usertrap(void)
     // Check if address is valid (reject page 0 for null pointer safety)
     if(va < PGSIZE || va >= p->sz || va >= MAXVA) {
       printf("COW page fault: invalid address 0x%lx (sz=0x%lx)\n", va, p->sz);
-      setkilled(p);
+      setkilled_thread(t);
       goto killed;
     }
     
@@ -103,7 +108,7 @@ usertrap(void)
         // allocate new page
         uint64 mem = (uint64) kalloc();
         if(mem == 0) {
-          setkilled(p);
+          setkilled_thread(t);
           return 0;
         }
         // copy data from old page to new page
@@ -127,7 +132,7 @@ usertrap(void)
       // Not a COW page, and vmfault failed - can't handle this
       printf("usertrap(): unhandled page fault scause 0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      setkilled_thread(t);
     } else {
       // vmfault succeeded, lazy allocation handled it
       lazy_alloc_faults++;
@@ -139,7 +144,7 @@ usertrap(void)
       // vmfault failed - invalid address
       printf("usertrap(): load page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      setkilled_thread(t);
     }
   } else if(r_scause() == 12) {
     // Instruction page fault - try lazy allocation
@@ -147,17 +152,17 @@ usertrap(void)
       // vmfault failed - invalid address  
       printf("usertrap(): instruction page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      setkilled_thread(t);
     }
   }
   else{
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
+    setkilled_thread(t);
   }
 
 killed:
-  if(killed(p))
+  if(killed_thread(t))
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
@@ -197,6 +202,10 @@ prepare_return(void)
   p->trapframe->kernel_trap = (uint64)usertrap;
   p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
 
+  // Set sscratch to point to this thread's trapframe address
+  // The trampoline will use this to save/restore registers
+  w_sscratch((uint64) TRAPFRAME);
+
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
   
@@ -226,13 +235,37 @@ kerneltrap()
     panic("kerneltrap: interrupts enabled");
 
   if((which_dev = devintr()) == 0){
+    // Not a device interrupt - check if it's a page fault we can handle
+    if(scause == 13 || scause == 15) {
+      // Load page fault (13) or Store/AMO page fault (15)
+      // These shouldn't happen in kernel mode - kernel addresses should always be mapped
+      printf("Kernel page fault: scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, sepc, r_stval());
+      struct proc *p = myproc();
+      struct thread *t = mythread();
+      printf("myproc()=%p mythread()=%p\n", p, t);
+      if(t) {
+        printf("thread: state=%d tid=%d kstack=0x%lx\n", t->state, t->tid, t->kstack);
+      }
+      panic("kernel page fault");
+    }
+    
     // interrupt or trap from an unknown source
     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+    
+    // Try to get some context
+    struct proc *p = myproc();
+    struct thread *t = mythread();
+    printf("myproc()=%p mythread()=%p\n", p, t);
+    if(t) {
+      printf("thread state=%d tid=%d\n", t->state, t->tid);
+    }
+    
     panic("kerneltrap");
   }
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
+  struct thread *t = mythread();
+  if(which_dev == 2 && t != 0)
     yield();
 
   // the yield() may have caused some traps to occur,

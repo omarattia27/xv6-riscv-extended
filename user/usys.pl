@@ -45,3 +45,4 @@ entry("uptime");
 entry("msgget");
 entry("msgsnd");
 entry("msgrcv");
+entry("thread_create");

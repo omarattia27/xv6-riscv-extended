@@ -4,6 +4,7 @@ struct file;
 struct inode;
 struct pipe;
 struct proc;
+struct thread;
 struct spinlock;
 struct sleeplock;
 struct stat;
@@ -88,8 +89,11 @@ void            proc_freepagetable(pagetable_t, uint64);
 int             kkill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
+int             killed_thread(struct thread*);
+void            setkilled_thread(struct thread*);
 struct cpu*     mycpu(void);
 struct proc*    myproc();
+struct thread*  mythread();
 void            procinit(void);
 void            scheduler(void) __attribute__((noreturn));
 void            sched(void);
@@ -101,6 +105,7 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+int             thread_create(void (*fn)(void));
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -142,6 +147,7 @@ void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            prepare_return(void);
+uint64          usertrap(void);
 
 // uart.c
 void            uartinit(void);
