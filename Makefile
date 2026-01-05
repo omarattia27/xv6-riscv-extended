@@ -149,7 +149,6 @@ UPROGS=\
 	$U/_cowtest\
 	$U/_testboth\
 	$U/_threadtest\
-	$U/_threadtest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

@@ -151,11 +151,24 @@ int
 holding(struct spinlock *lk)
 {
   int r;
-  if(lk == 0) {
-    printf("holding: NULL lock pointer!\n");
-    printf("Called from: (use backtrace)\n");
-    return 0;  // or panic("holding: NULL lock");
+  
+  // Critical: Check if we're being called with a corrupted lock pointer
+  if(lk == 0 || (uint64)lk < 0x80000000) {
+    printf("holding: invalid lock pointer lk=%p\n", lk);
+    printf("This may indicate stack or process corruption\n");
+    
+    // Try to get current cpu info safely
+    int hart_id = r_tp();
+    if(hart_id >= 0 && hart_id < NCPU) {
+      printf("hart_id=%d seems valid\n", hart_id);
+      struct cpu *c = &cpus[hart_id];
+      printf("cpu=%p proc=%p thread=%p\n", c, c->proc, c->thread);
+    } else {
+      printf("hart_id=%d is invalid!\n", hart_id);
+    }
+    return 0;  // Safe return to avoid panic in exit path
   }
+  
   r = (lk->locked && lk->cpu == mycpu());
   return r;
 }
@@ -181,7 +194,23 @@ push_off(void)
 void
 pop_off(void)
 {
+  // Early corruption detection
+  int hart_id = r_tp();
+  if(hart_id < 0 || hart_id >= NCPU) {
+    printf("pop_off: CORRUPTION DETECTED! tp=%d (should be 0-%d)\n", hart_id, NCPU-1);
+    printf("This will cause a page fault when accessing cpus[%d]\n", hart_id);
+    panic("pop_off: tp register corrupted");
+  }
+  
   struct cpu *c = mycpu();
+  
+  // Validate cpu structure
+  if(c == 0 || (uint64)c < 0x80000000) {
+    printf("pop_off: Invalid cpu pointer: %p\n", c);
+    printf("hart_id=%d cpus array at %p\n", hart_id, &cpus[0]);
+    panic("pop_off: invalid cpu pointer");
+  }
+  
   if(intr_get())
     panic("pop_off - interruptible");
   if(c->noff < 1)

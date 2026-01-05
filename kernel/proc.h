@@ -129,7 +129,8 @@ struct thread {
   void *chan;                  // If non-zero, sleeping on chan
   int killed;                  // If non-zero, thread has been killed
   int xstate;                  // Exit status to be returned to parent's thread_join
-  int tid;                     // Thread ID
+  int tid;                     // Thread ID (global)
+  int thread_slot;             // Thread slot within process (0=main, 1=first thread, 2=second thread)
 
   // Scheduling fields
   int cpu_ticks;               // Number of ticks thread has run

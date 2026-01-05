@@ -83,6 +83,7 @@ int init_thread(struct thread *t) {
   t->killed = 0;
   t->xstate = 0;
   t->tid = -1;
+  t->thread_slot = -1;  // Initialize thread slot
   t->cpu_ticks = 0;
   t->time_slices_left = 0;
   t->age_in_low_queue = 0;
@@ -246,6 +247,7 @@ found:
   struct thread *t = p->threads[0];
   t->proc = p;
   t->tid = 0;  // Main thread always has tid 0
+  t->thread_slot = 0;  // Main thread is always slot 0
   t->state = T_USED;
   t->trapframe = p->trapframe;
   t->trapframe_va = TRAPFRAME;
@@ -467,6 +469,7 @@ userinit(void)
 int thread_create(void (*fn)(void)){
   struct proc *p = myproc();
   struct thread *t = 0;
+  printf("the address of the function fn is: 0x%lx\n", (uint64)fn);
 
   // Find an UNUSED thread slot (skip 0, as it's the main thread)
   for(int i = 1; i < NTHREAD; i++) {
@@ -497,11 +500,13 @@ int thread_create(void (*fn)(void)){
           t->trapframe->kernel_satp = r_satp();              // Current kernel page table
           t->trapframe->kernel_sp = t->kstack + PGSIZE;      // Thread's kernel stack
           t->trapframe->kernel_trap = (uint64)usertrap;      // Trap handler
-          t->trapframe->kernel_hartid = r_tp();              // Current hart ID
+          t->trapframe->kernel_hartid = r_tp();              // Current hart ID fo rthe creating thread
           t->trapframe->epc = (uint64)fn;                    // Thread function entry point
           t->trapframe->sp = t->stack_base + USERSTACK * PGSIZE; // Thread's user stack
           t->trapframe->a0 = 0;                              // Clear return value
           
+          printf("thread_create: thread %d stack_base=0x%lx calculated_sp=0x%lx\n", 
+                 i, t->stack_base, t->trapframe->sp);
           printf("thread_create: setting epc=0x%lx sp=0x%lx\n", 
                  t->trapframe->epc, t->trapframe->sp);
         } else {
@@ -518,6 +523,7 @@ int thread_create(void (*fn)(void)){
         // Get TID (simplified - no lock juggling)
         static int next_tid = 1;
         t->tid = next_tid++;
+        t->thread_slot = i;  // Set thread slot within process (1 or 2)
 
         // Initialize priority to -1 so scheduler will add it to queue
         t->priority = -1;
@@ -642,13 +648,34 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
+// Exit the current process.  Does not return.
+// An exited process remains in the zombie state
+// until its parent calls wait().
 void
 kexit(int status)
 {
   struct proc *p = myproc();
+  struct thread *t = mythread();
 
   if(p == initproc)
     panic("init exiting");
+    
+  // If this is not the main thread (tid != 0), just exit the thread
+  if(t->tid != 0) {
+    printf("kexit: thread %d exiting (not killing process)\n", t->tid);
+    
+    // Just mark this thread as zombie and schedule out
+    // Don't close files or change process state - that's only for main thread
+    acquire(&t->lock);
+    t->xstate = status;
+    t->state = T_ZOMBIE;
+    sched();
+    
+    panic("thread should not return from sched");
+  }
+
+  // This is the main thread - exit the entire process
+  printf("kexit: main thread exiting, killing entire process\n");
 
   // Close all open files.
   acquire(&p->fd_lock);
@@ -685,14 +712,11 @@ kexit(int status)
   release(&wait_lock);
 
   // Now mark this thread as zombie and schedule out
-  // Must hold ONLY t->lock when calling sched()
-  struct thread *t = mythread();
   acquire(&t->lock);
   t->xstate = status;
   t->state = T_ZOMBIE;
-
-  // Jump into the scheduler, never to return.
   sched();
+  
   panic("zombie exit");
 }
 
@@ -741,6 +765,13 @@ kwait(uint64 addr)
     }
     
     // Wait for a child to exit.
+    // Note: sleep() will acquire mythread()->lock itself, so we must not hold it
+    struct thread *t = mythread();
+    if(t && holding(&t->lock)) {
+      // Unexpected: we shouldn't normally hold the lock here
+      panic("kwait: thread lock held unexpectedly");
+    }
+    // Normal case: lock not held, sleep will acquire it
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
 }
@@ -1014,8 +1045,10 @@ scheduler(void)
         c->thread = 0;
         found = 1;
       }
-      // Always release the thread lock after switching
-      release(&t->lock);
+      // Always release the thread lock after we acquired it
+      if(holding(&t->lock)) {
+        release(&t->lock);
+      }
     }
     queue_update_priorities();
 
@@ -1066,17 +1099,22 @@ yield(void)
     return;  // Nothing to yield if no thread running
     
   // Check if we already hold the lock (scheduler context)
-  if(holding(&t->lock)) {
-    // We already hold the lock (scheduler has it), just change state and sched
-    t->state = T_RUNNABLE;
-    sched();
-  } else {
-    // Normal case - acquire lock, change state, sched, release lock
-    acquire(&t->lock);
-    t->state = T_RUNNABLE;
-    sched();
-    release(&t->lock);
-  }
+  // if(holding(&t->lock)) {
+  //   // We already hold the lock (scheduler has it), just change state and sched
+  //   t->state = T_RUNNABLE;
+  //   sched();
+  // } else {
+    // Normal case - acquire lock, change state, sched
+    // Note: sched() never returns here, scheduler releases lock
+  if(holding(&t->lock))
+    panic("yield: already holding t->lock");
+
+  acquire(&t->lock);
+  t->state = T_RUNNABLE;
+  sched();
+  release(&t->lock);
+    // This line is never reached - scheduler releases the lock
+  //}
 }
 
 // A thread's very first return to user space
@@ -1085,22 +1123,28 @@ yield(void)
 void threadret(void) {
   struct thread *t = mythread();
   struct proc *p = t->proc;
+  extern char userret[];
   extern char uservec[];
 
-  // Scheduler has already released the thread lock
+  // Still holding t->lock from scheduler.
+  release(&t->lock);
 
-  // Set up this thread's trapframe kernel fields manually
-  t->trapframe->kernel_satp = r_satp();         // kernel page table  
-  t->trapframe->kernel_sp = t->kstack + PGSIZE; // thread's kernel stack
-  t->trapframe->kernel_trap = (uint64)usertrap;
-  t->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
-
-  // Prepare for user space transition without using prepare_return()
+  // Thread-specific version of prepare_return() using thread's own trapframe
   intr_off();
   
-  // Set up trampoline and scratch register
+  // Send syscalls, interrupts, and exceptions to uservec in trampoline.S
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
   w_stvec(trampoline_uservec);
+
+  // Set up thread's trapframe values for kernel entry
+  t->trapframe->kernel_satp = r_satp();
+  t->trapframe->kernel_sp = t->kstack + PGSIZE;  // Thread's kernel stack
+  t->trapframe->kernel_trap = (uint64)usertrap;
+  t->trapframe->kernel_hartid = r_tp();
+
+  // CRITICAL: Set sscratch to point to thread's trapframe virtual address
+  // The trampoline needs this to save/restore registers
+  printf("threadret: setting sscratch to 0x%lx (thread trapframe)\n", t->trapframe_va);
   w_sscratch(t->trapframe_va);
 
   // Set up user mode
@@ -1109,13 +1153,30 @@ void threadret(void) {
   x |= SSTATUS_SPIE; // enable interrupts in user mode
   w_sstatus(x);
 
+  // Set S Exception Program Counter
   w_sepc(t->trapframe->epc);
   
-  // Return to user space
-  extern char userret[];
+  // CRITICAL DEBUG: Validate kernel stack setup
+  printf("threadret: kernel_sp=0x%lx kernel_trap=0x%lx\n", 
+         t->trapframe->kernel_sp, t->trapframe->kernel_trap);
+  printf("threadret: actual kstack=0x%lx (should match kernel_sp-PGSIZE)\n", t->kstack);
+  
+  // Use simpler debug output to avoid printf corruption
+  printf("threadret: about to jump to user space\n");
+  
+  // Return to user space using thread's own trapframe
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
   
+  // Validate trapframe mapping before jumping
+  pte_t *pte = walk(p->pagetable, t->trapframe_va, 0);
+  if(!pte || !(*pte & PTE_V)) {
+    printf("ERROR: trapframe_va 0x%lx not mapped!\n", t->trapframe_va);
+    panic("threadret: trapframe not mapped");
+  }
+  
+  // Final debug before the jump
+  printf("threadret: trapframe mapped OK, jumping to trampoline\n");
   ((void (*)(uint64))trampoline_userret)(satp);
 }
 
@@ -1155,6 +1216,23 @@ forkret(void)
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
   ((void (*)(uint64))trampoline_userret)(satp);
+}
+
+void threadret2(void){
+  extern char userret[];
+  static int first = 1;
+  struct proc *p = myproc();
+  struct thread *t = mythread();
+
+  // Still holding t->lock from scheduler (not p->lock anymore).
+  release(&t->lock);
+
+  // return to user space, mimicing usertrap()'s return.
+  prepare_return();
+  uint64 satp = MAKE_SATP(p->pagetable);
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
+ 
 }
 
 // Sleep on channel chan, releasing condition lock lk.
@@ -1207,7 +1285,7 @@ wakeup(void *chan)
       if(t->state == T_UNUSED)
         continue;
       
-      // During early boot, skip thread operations that might cause lock conflicts
+      // During early boot, only wake up properly initialized threads
       if(!threading_initialized && t->magic != 0xDEADBEEFCAFEBABE)
         continue;
       
@@ -1215,14 +1293,9 @@ wakeup(void *chan)
       if(t == mythread())
         continue;
       
-      // Skip threads whose lock is already locked to avoid double-acquire
-      if(t->lock.locked){
-        if(t->state == T_SLEEPING && t->chan == chan) {
-          t->state = T_RUNNABLE;
-        }
-        release(&t->lock);
+      // Only try to acquire lock if we don't already hold it
+      if(holding(&t->lock))
         continue;
-      }
         
       acquire(&t->lock);
       if(t->state == T_SLEEPING && t->chan == chan) {
@@ -1298,9 +1371,9 @@ killed_thread(struct thread *t)
     return t->killed;  // Safe to read without lock for current thread
   }
   
-  acquire(&t->lock);
+  //acquire(&t->lock);
   k = t->killed;
-  release(&t->lock);
+  //release(&t->lock);
   return k;
 }
 

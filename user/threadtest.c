@@ -6,8 +6,15 @@
 volatile int thread_executed = 0;
 
 void thread_func1(void) {
+    // Use a simple write to test if thread actually starts
+    // This avoids printf complications
+    
     // Write to global variable to indicate execution - no printf to avoid locks
     thread_executed = 42;
+    
+    // Try to write a simple message directly to avoid printf
+    write(1, "Thread: executing!\n", 19);
+    
     exit(0);
 }
 
