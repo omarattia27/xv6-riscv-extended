@@ -108,6 +108,7 @@ extern uint64 sys_msgget(void);
 extern uint64 sys_msgsnd(void);
 extern uint64 sys_msgrcv(void);
 extern uint64 sys_thread_create(void);
+extern uint64 sys_thread_join(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -137,6 +138,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_msgsnd]  sys_msgsnd,
 [SYS_msgrcv]  sys_msgrcv,
 [SYS_thread_create] sys_thread_create,
+[SYS_thread_join] sys_thread_join,
 };
 
 void
@@ -144,15 +146,16 @@ syscall(void)
 {
   int num;
   struct proc *p = myproc();
+  struct thread *t = mythread();
 
-  num = p->trapframe->a7;
+  num = t->trapframe->a7;  // CRITICAL FIX: Use thread's trapframe, not process's
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
-    p->trapframe->a0 = syscalls[num]();
+    // and store its return value in THREAD's trapframe->a0
+    t->trapframe->a0 = syscalls[num]();
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);
-    p->trapframe->a0 = -1;
+    t->trapframe->a0 = -1;
   }
 }

@@ -104,10 +104,16 @@ userret:
         # usertrap() returns here, with user satp in a0.
         # return from kernel to user.
 
+        # DEBUG: Save sepc before page table switch
+        csrr t1, sepc
+
         # switch to the user page table.
         sfence.vma zero, zero
         csrw satp, a0
         sfence.vma zero, zero
+
+        # DEBUG: Check if sepc changed after page table switch
+        csrr t2, sepc
 
         # Get trapframe address from sscratch (thread-specific)
         csrr a0, sscratch
@@ -147,6 +153,10 @@ userret:
 	# restore user a0
         ld a0, 112(a0)
         
+        # DEBUG: For debugging Thread 1, save sepc to t0 for inspection
+        # This will show up in the register dump when Thread 1 traps
+        csrr t0, sepc
+        
         # return to user mode and user pc.
-        # usertrapret() set up sstatus and sepc.
+        # sepc should already be set correctly by threadret
         sret

@@ -620,10 +620,31 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
   struct proc *p = myproc();
+  struct thread *t = mythread();
   static int lazy_alloc_count = 0;
 
-  if (va >= p->sz)
+  // Check if this is access to the thread stack area (16KB to 32KB + stack size)
+  if (t && va >= 16384 && va < 40960) { // 16KB to 40KB covers all 3 thread stacks
+    // Check if this thread is allowed to access this specific stack
+    uint64 thread_stack_base = t->stack_base;
+    uint64 thread_stack_top = thread_stack_base + USERSTACK*PGSIZE;
+    
+    printf("VMFAULT: Thread %d accessing 0x%lx, stack range: 0x%lx-0x%lx\n", 
+           t->tid, va, thread_stack_base, thread_stack_top);
+    
+    if (va < thread_stack_base || va >= thread_stack_top) {
+      // Thread is trying to access a different thread's stack or guard area
+      // This should cause a segmentation fault, not be allocated
+      printf("SEGFAULT: Thread %d illegal access at 0x%lx (valid range: 0x%lx-0x%lx)\n", 
+             t->tid, va, thread_stack_base, thread_stack_top);
+      return 0; // Fail the page fault - this will kill the process
+    }
+  }
+
+  // Normal heap/data area check - exclude thread stack ranges
+  if (va >= p->sz && (va < 16384 || va >= 40960))
     return 0;
+    
   va = PGROUNDDOWN(va);
   if(ismapped(pagetable, va)) {
     return 0;

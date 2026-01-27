@@ -47,6 +47,7 @@ trapinithart(void)
 uint64
 usertrap(void)
 {
+
   int which_dev = 0;
 
   if((r_sstatus() & SSTATUS_SPP) != 0)
@@ -59,13 +60,60 @@ usertrap(void)
   struct proc *p = myproc();
   struct thread *t = mythread();
   
+  // CRITICAL DEBUG: Track if wrong thread is being used for trap saving
+  static int debug_count = 0;
+  // if (debug_count < 10) {
+  //   printf("USERTRAP DEBUG %d: mythread()=%p slot=%d tid=%d, sepc=0x%lx\n", 
+  //          debug_count, t, t ? t->thread_slot : -1, t ? t->tid : -1, r_sepc());
+  //   debug_count++;
+  // }
+  
+  // Only debug Thread 1's first few traps to avoid output spam
+  static int thread1_trap_count = 0;
+  // if (t && t->thread_slot == 1 && thread1_trap_count < 5) {
+  //   printf("USERTRAP: thread slot %d (tid %d), sepc=0x%lx, trapframe=%p\n", 
+  //          t->thread_slot, t->tid, r_sepc(), t->trapframe);
+  //   thread1_trap_count++;
+  // }
+  
   // Sanity check: we should always have a valid thread in usertrap
   if(t == 0)
     panic("usertrap: no thread");
   
-  // CRITICAL FIX: save user program counter to the THREAD's trapframe
+  // Additional validation: check thread magic and trapframe
+  if(t->magic != 0xDEADBEEFCAFEBABE) {
+    printf("usertrap(): thread magic corrupted! magic=0x%lx\\n", t->magic);
+    panic("usertrap: thread corrupted");
+  }
+  
+  if(t->trapframe == 0) {
+    printf("usertrap(): thread trapframe is NULL!\\n");
+    panic("usertrap: no trapframe");
+  }
+  
+  // CRITICAL: Detect trapframe corruption before saving sepc
+  uint64 old_epc = t->trapframe->epc;
+  
+  // save user program counter to the THREAD's trapframe
   // Each thread has its own trapframe, don't use p->trapframe for threads
   t->trapframe->epc = r_sepc();
+  
+  // CRITICAL: Detect if we're about to execute kernel code in user space
+  // if(t->trapframe->epc >= 0x80000000) {
+  //   printf("CORRUPTION DETECTED: Thread %d trapframe->epc corrupted!\n", t->tid);
+  //   printf("  OLD EPC: 0x%lx\n", old_epc);
+  //   printf("  NEW EPC: 0x%lx (KERNEL ADDRESS!)\n", t->trapframe->epc);
+  //   printf("  sepc(): 0x%lx\n", r_sepc());
+  //   printf("  trapframe address: %p\n", t->trapframe);
+    
+  //   // Check if sepc itself is corrupted or if it's the trapframe
+  //   if(r_sepc() >= 0x80000000) {
+  //     printf("  -> sepc() register is corrupted!\n");
+  //   } else {
+  //     printf("  -> sepc() is OK, trapframe memory is corrupted!\n");
+  //   }
+  //   panic("Trapframe corruption detected");
+  // }
   
   if(r_scause() == 8){
     // system call
@@ -133,7 +181,15 @@ usertrap(void)
     } else if(vmfault(p->pagetable, r_stval(), 0) == 0) {
       // Not a COW page, and vmfault failed - can't handle this
       printf("usertrap(): unhandled page fault scause 0x%lx pid=%d\n", r_scause(), p->pid);
-      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      printf("            sepc=0x%lx (trapframe epc=0x%lx) stval=0x%lx\n", r_sepc(), t->trapframe->epc, r_stval());
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
       setkilled_thread(t);
     } else {
       // vmfault succeeded, lazy allocation handled it
@@ -146,6 +202,14 @@ usertrap(void)
       // vmfault failed - invalid address
       printf("usertrap(): load page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Load page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
       setkilled_thread(t);
     }
   } else if(r_scause() == 12) {
@@ -154,6 +218,14 @@ usertrap(void)
       // vmfault failed - invalid address  
       printf("usertrap(): instruction page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Instruction page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
       setkilled_thread(t);
     }
   }
@@ -189,6 +261,14 @@ prepare_return(void)
   struct proc *p = myproc();
   struct thread *t = mythread();
 
+  // CRITICAL DEBUG: Check if prepare_return is using wrong thread after yield
+  static int prep_debug_count = 0;
+  // if(prep_debug_count < 5) {
+  //   printf("PREPARE_RETURN DEBUG: CPU %d using thread %d (slot %d) trapframe=%p\n",
+  //          cpuid(), t ? t->tid : -1, t ? t->thread_slot : -1, t ? t->trapframe : 0);
+  //   prep_debug_count++;
+  // }
+
   // we're about to switch the destination of traps from
   // kerneltrap() to usertrap(). because a trap from kernel
   // code to usertrap would be a disaster, turn off interrupts.
@@ -205,18 +285,20 @@ prepare_return(void)
   t->trapframe->kernel_trap = (uint64)usertrap;
   t->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
 
-  // Set sscratch to point to this thread's trapframe address
+  // CRITICAL: Set sscratch to point to this thread's trapframe virtual address
   // The trampoline will use this to save/restore registers
-  // Use thread_slot (0, 1, 2) to map to correct trapframe
-  if(t->thread_slot == 0) {
-    w_sscratch((uint64) TRAPFRAME);             // Main thread uses TRAPFRAME
-  } else if(t->thread_slot == 1) {
-    w_sscratch((uint64) TRAPFRAME2);            // Thread slot 1 uses TRAPFRAME2
-  } else if(t->thread_slot == 2) {
-    w_sscratch((uint64) TRAPFRAME3);            // Thread slot 2 uses TRAPFRAME3
-  } else {
-    panic("prepare_return: invalid thread_slot");
+  // Use the thread's pre-calculated trapframe_va for consistency
+  if(t->trapframe_va == 0) {
+    panic("prepare_return: trapframe_va is zero");
   }
+  w_sscratch(t->trapframe_va);
+  // Only debug Thread 1's first few sscratch sets to avoid spam
+  static int thread1_sscratch_count = 0; 
+  // if(t->thread_slot == 1 && thread1_sscratch_count < 5) {
+  //   printf("DEBUG: Set sscratch=0x%lx for thread slot %d (tid %d) trapframe_va=0x%lx\n", 
+  //          t->trapframe_va, t->thread_slot, t->tid, t->trapframe_va);
+  //   thread1_sscratch_count++;
+  // }
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.

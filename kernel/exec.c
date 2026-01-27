@@ -159,12 +159,27 @@ kexec(char *path, char **argv)
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
-  p->trapframe->sp = sp; // initialdpagetable, oldsz);
+  p->trapframe->sp = sp; // initial stack pointer
+  
+  // CRITICAL FIX: Initialize main thread (thread 0) trapframe with same values
+  // The scheduler uses p->threads[0]->trapframe, not p->trapframe
+  if(p->threads[0] && p->threads[0]->trapframe) {
+    p->threads[0]->trapframe->epc = elf.entry;  // Same as p->trapframe->epc
+    p->threads[0]->trapframe->sp = sp;          // Same as p->trapframe->sp
+    // printf("DEBUG exec: Initialized thread 0 trapframe: epc=0x%lx sp=0x%lx\n", 
+    //        p->threads[0]->trapframe->epc, p->threads[0]->trapframe->sp);
+  }
 
-  // Store stack bases for each thread
+  // Store stack bases for each thread (bottom boundaries)
   p->threads[0]->stack_base = stackbase;
   p->threads[1]->stack_base = stackbase2; 
   p->threads[2]->stack_base = stackbase3;
+  // printf("DEBUG exec: stackbase=0x%lx stackbase2=0x%lx stackbase3=0x%lx\n", 
+  //        stackbase, stackbase2, stackbase3);
+  // printf("DEBUG exec: sp=0x%lx sp2=0x%lx sp3=0x%lx\n", sp, sp2, sp3);
+  
+  // printf("DEBUG exec: stackbase=0x%lx stackbase2=0x%lx stackbase3=0x%lx\n", 
+  //        stackbase, stackbase2, stackbase3);
 
   // Check an address in the middle of each stack
 
@@ -191,8 +206,8 @@ kexec(char *path, char **argv)
       int is_user = (pte && (*pte & PTE_U));
       int is_writable = (pte && (*pte & PTE_W));
       
-      printf("Stack %d: va=0x%lx pte=%p flags=0x%lx (V=%d U=%d W=%d)\n", 
-            j, test_va, pte, pte ? *pte : 0, is_valid, is_user, is_writable);
+      // printf("Stack %d: va=0x%lx pte=%p flags=0x%lx (V=%d U=%d W=%d)\n", 
+      //       j, test_va, pte, pte ? *pte : 0, is_valid, is_user, is_writable);
       
       if (!pte || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
         all_writable = 0;
@@ -203,11 +218,11 @@ kexec(char *path, char **argv)
       }
   }
   
-  if (all_writable) {
-    printf("All stacks are user-writable!\n");
-  } else {
-    printf("WARNING: Not all stacks are user-writable\n");
-  }
+  // if (all_writable) {
+  //   printf("All stacks are user-writable!\n");
+  // } else {
+  //   printf("WARNING: Not all stacks are user-writable\n");
+  // }
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

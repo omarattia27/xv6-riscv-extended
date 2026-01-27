@@ -161,6 +161,28 @@ mythread(void)
   push_off();
   struct cpu *c = mycpu();
   struct thread *t = c->thread;
+  
+  // CRITICAL DEBUG: Track mythread() calls and detect wrong thread
+  static int debug_count = 0;
+  if(debug_count < 10) {
+    // Try to find the thread that should be executing based on current context
+    struct proc *p = c->proc;
+    struct thread *expected = 0;
+    if(p) {
+      // Check if this looks like main thread execution by looking at registers
+      // This is a rough heuristic - main thread typically has different register patterns
+      expected = p->threads[0];  // Assume main thread for now
+    }
+    
+    // printf("MYTHREAD DEBUG %d: c->thread=%p (slot=%d tid=%d), expected=%p, proc=%p\n", 
+    //        debug_count, t, t ? t->thread_slot : -1, t ? t->tid : -1, expected, p);
+    
+    // if(t && expected && t != expected && t->thread_slot != 0) {
+    //   printf("  WARNING: c->thread points to Thread %d but should probably be main thread!\n", t->thread_slot);
+    // }
+    debug_count++;
+  }
+  
   pop_off();
   return t;
 }
@@ -466,10 +488,96 @@ userinit(void)
   set_threading_initialized();
 }
 
+// Wait for a thread with given tid to exit and return its exit status.
+// Return 0 on success with exit status, -1 on error.
+int thread_join(int tid, uint64 addr)
+{
+  struct thread *target_thread = 0;
+  struct proc *p = myproc();
+  int found_thread = 0;
+
+  // Can't join the main thread (tid 0) or yourself
+  if(tid <= 0) {
+    return -1;
+  }
+  
+  struct thread *current = mythread();
+  if(current && current->tid == tid) {
+    return -1; // Can't join yourself
+  }
+
+  acquire(&p->lock);
+
+  for(;;){
+    // Scan through this process's threads looking for the target tid
+    found_thread = 0;
+    target_thread = 0;
+    
+    for(int i = 0; i < NTHREAD; i++) {
+      struct thread *t = p->threads[i];
+      if(t == 0)
+        continue;
+        
+      acquire(&t->lock);
+      if(t->tid == tid && t->state != T_UNUSED) {
+        found_thread = 1;
+        target_thread = t;
+        
+        if(t->state == T_ZOMBIE) {
+          // Found zombie thread - get exit status and clean up
+          int xstate = t->xstate;
+          if(addr != 0 && copyout(p->pagetable, addr, (char *)&xstate,
+                                  sizeof(xstate)) < 0) {
+            release(&t->lock);
+            release(&p->lock);
+            return -1;
+          }
+          
+          // Clean up thread but don't free memory (reuse for next thread)
+          t->state = T_UNUSED;
+          t->chan = 0;
+          t->killed = 0;
+          t->xstate = 0;
+          t->tid = -1;
+          t->cpu_ticks = 0;
+          t->time_slices_left = 0;
+          t->age_in_low_queue = 0;
+          t->age_in_high_queue = 0;
+          t->priority = -1;
+          
+          release(&t->lock);
+          release(&p->lock);
+          return 0; // Success
+        }
+        release(&t->lock);
+        break; // Found thread but not zombie yet
+      }
+      release(&t->lock);
+    }
+
+    // No thread with this tid exists
+    if(!found_thread) {
+      release(&p->lock);
+      return -1;
+    }
+    
+    // Thread exists but not zombie yet - check if current thread was killed
+    if(killed_thread(mythread())) {
+      release(&p->lock);
+      return -1;
+    }
+    
+    // Wait for the thread to exit
+    // Sleep on the specific tid as the channel
+    sleep((void*)(uint64)tid, &p->lock);
+    // p->lock will be reacquired when we wake up
+  }
+}
+
 int thread_create(void (*fn)(void)){
+  // printf("thread_create: kernel received fn=0x%lx\n", (uint64)fn);
   struct proc *p = myproc();
   struct thread *t = 0;
-  printf("the address of the function fn is: 0x%lx\n", (uint64)fn);
 
   // Find an UNUSED thread slot (skip 0, as it's the main thread)
   for(int i = 1; i < NTHREAD; i++) {
@@ -486,10 +594,23 @@ int thread_create(void (*fn)(void)){
         if(i == 1) {
           t->trapframe = p->trapframe2;
           t->trapframe_va = TRAPFRAME2;
+          // printf("DEBUG: Thread 1 trapframe=%p, main trapframe=%p\n", p->trapframe2, p->trapframe);
         } else if(i == 2) {
           t->trapframe = p->trapframe3;
           t->trapframe_va = TRAPFRAME3;
+          // printf("DEBUG: Thread 2 trapframe=%p, main trapframe=%p\n", p->trapframe3, p->trapframe);
         }
+
+        // stack_base should already be set by exec
+        if(t->stack_base == 0) {
+          printf("ERROR: stack_base not set for thread %d\n", i);
+          release(&p->threads[i]->lock);
+          return -1;
+        }
+        
+        // printf("DEBUG: thread_create slot %d, stack_base=0x%lx\n", i, t->stack_base);
+        // printf("DEBUG: trapframe=%p trapframe_va=0x%lx sp=0x%lx\n", 
+        //        t->trapframe, t->trapframe_va, t->trapframe->sp);
 
         // Set up trapframe completely independently - no dependency on p->trapframe
         if(t->trapframe) {
@@ -500,15 +621,39 @@ int thread_create(void (*fn)(void)){
           t->trapframe->kernel_satp = r_satp();              // Current kernel page table
           t->trapframe->kernel_sp = t->kstack + PGSIZE;      // Thread's kernel stack
           t->trapframe->kernel_trap = (uint64)usertrap;      // Trap handler
-          t->trapframe->kernel_hartid = r_tp();              // Current hart ID fo rthe creating thread
+          t->trapframe->kernel_hartid = r_tp();              // Current hart ID
           t->trapframe->epc = (uint64)fn;                    // Thread function entry point
-          t->trapframe->sp = t->stack_base + USERSTACK * PGSIZE; // Thread's user stack
+          t->trapframe->sp = t->stack_base + USERSTACK*PGSIZE;  // Stack pointer at top of usable stack
           t->trapframe->a0 = 0;                              // Clear return value
           
-          printf("thread_create: thread %d stack_base=0x%lx calculated_sp=0x%lx\n", 
-                 i, t->stack_base, t->trapframe->sp);
-          printf("thread_create: setting epc=0x%lx sp=0x%lx\n", 
-                 t->trapframe->epc, t->trapframe->sp);
+          // CRITICAL: Initialize all general purpose registers to known safe values
+          // For threads, ra should point to exit function so when thread_func returns, it calls exit(0)
+          t->trapframe->ra = 0x11a6;  // Correct address of exit function (from symbol table)
+          t->trapframe->gp = 0;     // Global pointer
+          t->trapframe->tp = 0;     // Thread pointer (user mode)
+          
+          // Initialize all temporary and saved registers
+          t->trapframe->t0 = t->trapframe->t1 = t->trapframe->t2 = 0;
+          t->trapframe->s0 = 0;  // No previous frame - let first function set up s0 properly
+          t->trapframe->s1 = 0;
+          t->trapframe->a1 = t->trapframe->a2 = t->trapframe->a3 = 0;
+          t->trapframe->a4 = t->trapframe->a5 = t->trapframe->a6 = t->trapframe->a7 = 0;
+          t->trapframe->s2 = t->trapframe->s3 = t->trapframe->s4 = t->trapframe->s5 = 0;
+          t->trapframe->s6 = t->trapframe->s7 = t->trapframe->s8 = t->trapframe->s9 = 0;
+          t->trapframe->s10 = t->trapframe->s11 = 0;
+          t->trapframe->t3 = t->trapframe->t4 = t->trapframe->t5 = t->trapframe->t6 = 0;
+          
+          // CRITICAL: Double-check that epc is still set correctly after register init
+          if(t->trapframe->epc != (uint64)fn) {
+            printf("ERROR: epc corrupted during init! expected=0x%lx actual=0x%lx\n", 
+                   (uint64)fn, t->trapframe->epc);
+            panic("thread_create: epc corrupted");
+          }
+          
+          // printf("DEBUG: Created thread slot %d, sp=0x%lx, epc=0x%lx\n", i, t->trapframe->sp, t->trapframe->epc);
+          // printf("DEBUG: trapframe=%p trapframe_va=0x%lx\n", t->trapframe, t->trapframe_va);
+          
+          // Thread setup complete
         } else {
           printf("ERROR: trapframe is NULL!\n");
           release(&p->threads[i]->lock);
@@ -520,9 +665,35 @@ int thread_create(void (*fn)(void)){
         t->context.sp = t->kstack + PGSIZE;
         t->context.ra = (uint64)threadret;
 
-        // Get TID (simplified - no lock juggling)
-        static int next_tid = 1;
-        t->tid = next_tid++;
+        // Get TID - use process-local TID assignment
+        // Find the next available TID within this process
+        int assigned_tid = -1;
+        for(int tid_candidate = 1; tid_candidate < 1000; tid_candidate++) {
+          int tid_in_use = 0;
+          
+          // Check if this TID is already used by another thread in this process
+          for(int j = 0; j < NTHREAD; j++) {
+            if(p->threads[j] && j != i) {
+              if(p->threads[j]->tid == tid_candidate) {
+                tid_in_use = 1;
+                break;
+              }
+            }
+          }
+          
+          if(!tid_in_use) {
+            assigned_tid = tid_candidate;
+            break;
+          }
+        }
+        
+        if(assigned_tid == -1) {
+          printf("ERROR: Could not assign TID\n");
+          release(&p->threads[i]->lock);
+          return -1;
+        }
+        
+        t->tid = assigned_tid;
         t->thread_slot = i;  // Set thread slot within process (1 or 2)
 
         // Initialize priority to -1 so scheduler will add it to queue
@@ -662,15 +833,32 @@ kexit(int status)
     
   // If this is not the main thread (tid != 0), just exit the thread
   if(t->tid != 0) {
-    printf("kexit: thread %d exiting (not killing process)\n", t->tid);
     
-    // Just mark this thread as zombie and schedule out
-    // Don't close files or change process state - that's only for main thread
+    // printf("DEBUG: kexit() called for thread %d with status %d\n", t->tid, status);
+    
+    // Mark this thread as zombie and wake up any joiners
     acquire(&t->lock);
     t->xstate = status;
     t->state = T_ZOMBIE;
+    
+    // printf("DEBUG: Thread %d marked as T_ZOMBIE, attempting queue removal\n", t->tid);
+    
+    // CRITICAL FIX: Remove thread from scheduler queues before exiting
+    // This prevents the zombie thread from being scheduled again
+    struct thread *removed = queue_remove(t->tid, t->priority);
+    // if(removed == t) {
+    //   printf("DEBUG: Thread %d successfully removed from queue\n", t->tid);
+    // } else {
+    //   printf("DEBUG: WARNING - Thread %d NOT found in queue (removed=%p)\n", t->tid, removed);
+    // }
+    
+    // Wake up any threads waiting to join this thread
+    wakeup((void*)(uint64)t->tid);
+    
+    // printf("DEBUG: Thread %d about to call sched()\n", t->tid);
     sched();
     
+    printf("ERROR: Thread %d returned from sched() - this should never happen!\n", t->tid);
     panic("thread should not return from sched");
   }
 
@@ -988,11 +1176,15 @@ void loop_proc_and_update_queues() {
       acquire(&t->lock);
       if(t->state == T_RUNNABLE && t->priority == -1) {
         // If thread is not already in a queue, add it
+        //printf("DEBUG: Adding new thread %d to queue (state=%d)\n", t->tid, t->state);
         t->priority = 0; // Default to high priority queue
         t->time_slices_left = 3; // Initial time slice allocation
         release(&t->lock);
         queue_push(t);
       } else {
+        if(t->state != T_RUNNABLE) {
+          //printf("DEBUG: Thread %d not runnable (state=%d, priority=%d)\n", t->tid, t->state, t->priority);
+        }
         release(&t->lock);
       }
     }
@@ -1036,7 +1228,35 @@ scheduler(void)
         t->state = T_RUNNING;
         c->thread = t;
         c->proc = t->proc;  // Also set proc for compatibility
+        // printf("SCHEDULER: CPU %d about to run thread %d, trapframe->epc=0x%lx\n", cpuid(), t->tid, t->trapframe->epc);
+        
+        // CRITICAL: Track Thread 1's trapframe corruption
+        // if(t->thread_slot == 1 && t->trapframe->epc != 0x1000) {
+        //   printf("CRITICAL: Thread 1 trapframe CORRUPTED! EPC=0x%lx (should be 0x1000)\n", t->trapframe->epc);
+        //   printf("  Thread 1 will execute wrong code!\n");
+        // }
+        
+        // CRITICAL: Debug Thread 1's first execution
+        static int thread1_first_run = 0;
+        // if(t->thread_slot == 1 && !thread1_first_run) {
+        //   printf("\\n=== CRITICAL: Thread 1 FIRST EXECUTION ===\\n");
+        //   printf("EPC: 0x%lx (should be 0x1000 for thread_func1)\\n", t->trapframe->epc);
+        //   printf("SP: 0x%lx\\n", t->trapframe->sp);
+        //   printf("RA: 0x%lx\\n", t->trapframe->ra);
+        //   printf("Thread slot: %d, TID: %d\\n", t->thread_slot, t->tid);
+        //   printf("Trapframe: %p\\n", t->trapframe);
+        //   printf("=== END Critical Thread 1 debug ===\\n\\n");
+        //   thread1_first_run = 1;
+        // }
+        
         swtch(&c->context, &t->context);
+        
+        // CRITICAL: Check if Thread 1's trapframe was corrupted during context switch
+        // if(t->thread_slot == 1 && t->trapframe->epc != 0x1000) {
+        //   printf("CRITICAL: Thread 1 trapframe corrupted DURING context switch! EPC=0x%lx\n", t->trapframe->epc);
+        //   printf("  Context switch corrupted Thread 1's execution state!\n");
+        // }
+        
         if(t->state == T_RUNNING)
           panic("scheduler: thread still RUNNING after swtch");
         // Thread is done running for now.
@@ -1044,6 +1264,13 @@ scheduler(void)
         c->proc = 0;
         c->thread = 0;
         found = 1;
+      } else if(t->state == T_ZOMBIE) {
+        // CRITICAL: This should not happen if queue_remove is working
+        printf("ERROR: Scheduler found zombie thread %d in queue! state=%d\n", t->tid, t->state);
+        // Don't run zombie threads
+      } else {
+        // Thread is in some other state (sleeping, etc)
+        // This is normal, just skip it
       }
       // Always release the thread lock after we acquired it
       if(holding(&t->lock)) {
@@ -1126,6 +1353,21 @@ void threadret(void) {
   extern char userret[];
   extern char uservec[];
 
+  // Validate thread state before proceeding
+  if(!t || t->magic != 0xDEADBEEFCAFEBABE) {
+    panic("threadret: invalid thread");
+  }
+  
+  if(!t->trapframe) {
+    panic("threadret: no trapframe");
+  }
+
+  // Validate that the trapframe->epc is not zero
+  if(t->trapframe->epc == 0) {
+    printf("ERROR: threadret: epc is zero for thread %d!\n", t->tid);
+    panic("threadret: epc is zero");
+  }
+
   // Still holding t->lock from scheduler.
   release(&t->lock);
 
@@ -1136,16 +1378,28 @@ void threadret(void) {
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
   w_stvec(trampoline_uservec);
 
-  // Set up thread's trapframe values for kernel entry
+  // CRITICAL: Refresh trapframe values to ensure they're current
+  // Do this BEFORE setting sscratch to ensure trapframe is ready
   t->trapframe->kernel_satp = r_satp();
   t->trapframe->kernel_sp = t->kstack + PGSIZE;  // Thread's kernel stack
   t->trapframe->kernel_trap = (uint64)usertrap;
   t->trapframe->kernel_hartid = r_tp();
 
+  // Validate trapframe_va before using it
+  if(t->trapframe_va == 0) {
+    panic("threadret: trapframe_va is zero");
+  }
+
   // CRITICAL: Set sscratch to point to thread's trapframe virtual address
   // The trampoline needs this to save/restore registers
-  printf("threadret: setting sscratch to 0x%lx (thread trapframe)\n", t->trapframe_va);
   w_sscratch(t->trapframe_va);
+  
+  // Verify sscratch was set correctly
+  uint64 sscratch_check = r_sscratch();
+  if(sscratch_check != t->trapframe_va) {
+    printf("ERROR: sscratch mismatch! set=0x%lx read=0x%lx\n", t->trapframe_va, sscratch_check);
+    panic("threadret: sscratch mismatch");
+  }
 
   // Set up user mode
   unsigned long x = r_sstatus();
@@ -1153,16 +1407,45 @@ void threadret(void) {
   x |= SSTATUS_SPIE; // enable interrupts in user mode
   w_sstatus(x);
 
+  // CRITICAL: Double-check epc before setting sepc
+  if(t->trapframe->epc == 0) {
+    printf("CRITICAL ERROR: epc became zero before w_sepc!\n");
+    panic("threadret: epc corrupted");
+  }
+
+  // CRITICAL: Validate stack pointer is within reasonable bounds
+  if(t->trapframe->sp < t->stack_base || t->trapframe->sp > t->stack_base + USERSTACK*PGSIZE + 0x1000) {
+    printf("ERROR: corrupted stack pointer! sp=0x%lx stack_base=0x%lx\n", t->trapframe->sp, t->stack_base);
+    panic("threadret: stack pointer corrupted");
+  }
+
+  // CRITICAL: Final debug before Thread 1 enters user space
+  static int thread1_user_entry = 0;
+  // if(t->thread_slot == 1 && !thread1_user_entry) {
+  //   printf("\\n=== CRITICAL: Thread 1 entering user space ===\\n");
+  //   printf("Final EPC: 0x%lx (will be set to sepc)\\n", t->trapframe->epc);
+  //   printf("Final SP: 0x%lx\\n", t->trapframe->sp);
+  //   printf("Thread slot: %d, TID: %d\\n", t->thread_slot, t->tid);
+  //   printf("sscratch: 0x%lx\\n", r_sscratch());
+  //   printf("=== Thread 1 should execute thread_func1 at 0x1000 ===\\n\\n");
+  //   thread1_user_entry = 1;
+  // }
+
   // Set S Exception Program Counter
   w_sepc(t->trapframe->epc);
   
-  // CRITICAL DEBUG: Validate kernel stack setup
-  printf("threadret: kernel_sp=0x%lx kernel_trap=0x%lx\n", 
-         t->trapframe->kernel_sp, t->trapframe->kernel_trap);
-  printf("threadret: actual kstack=0x%lx (should match kernel_sp-PGSIZE)\n", t->kstack);
+  // CRITICAL: Verify trapframe->epc after w_sepc
+  // if(t->thread_slot == 1) {
+  //   printf("THREADRET: After w_sepc, thread_slot=%d tid=%d trapframe->epc=0x%lx sepc=0x%lx\n", 
+  //          t->thread_slot, t->tid, t->trapframe->epc, r_sepc());
+  // }
   
-  // Use simpler debug output to avoid printf corruption
-  printf("threadret: about to jump to user space\n");
+  // Verify that sepc was set correctly
+  uint64 sepc_check = r_sepc();
+  if(sepc_check != t->trapframe->epc) {
+    printf("ERROR: sepc mismatch! set=0x%lx read=0x%lx\n", t->trapframe->epc, sepc_check);
+    panic("threadret: sepc mismatch");
+  }
   
   // Return to user space using thread's own trapframe
   uint64 satp = MAKE_SATP(p->pagetable);
@@ -1175,8 +1458,24 @@ void threadret(void) {
     panic("threadret: trapframe not mapped");
   }
   
-  // Final debug before the jump
-  printf("threadret: trapframe mapped OK, jumping to trampoline\n");
+  // CRITICAL: Final trapframe check before userret
+  // if(t->thread_slot == 1) {
+  //   printf("THREADRET: Just before userret jump, thread_slot=%d tid=%d trapframe->epc=0x%lx sepc=0x%lx\n", 
+  //          t->thread_slot, t->tid, t->trapframe->epc, r_sepc());
+  //   
+  //   // CRITICAL: Verify TRAPFRAME2 mapping points to correct physical trapframe
+  //   pte_t *pte = walk(p->pagetable, TRAPFRAME2, 0);
+  //   uint64 mapped_pa = PTE2PA(*pte);
+  //   printf("CRITICAL: TRAPFRAME2 maps to PA=0x%lx, should be 0x%lx\n", 
+  //          mapped_pa, (uint64)t->trapframe);
+  //   printf("CRITICAL: Main trapframe PA=0x%lx\n", (uint64)p->trapframe);
+  // }
+  
+  // Jump to user space
+  // if(t->thread_slot == 1) {
+  //   printf("THREADRET: FINAL CHECK - trapframe->epc=0x%lx sepc=0x%lx\n", 
+  //          t->trapframe->epc, r_sepc());
+  // }
   ((void (*)(uint64))trampoline_userret)(satp);
 }
 

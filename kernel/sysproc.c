@@ -119,7 +119,18 @@ sys_thread_create(void)
   
   argaddr(0, &fn);
   
-  printf("sys_thread_create: fn=0x%lx\n", fn);
+  // printf("sys_thread_create: fn=0x%lx\n", fn);  // Removed to avoid mixed output
+  // printf("sys_thread_create: received fn=0x%lx\n", fn);  // Enable temporarily for debugging
   
   return thread_create((void (*)(void))fn);
+}
+
+uint64
+sys_thread_join(void)
+{
+  int tid;
+  uint64 addr;
+  argint(0, &tid);
+  argaddr(1, &addr);
+  return thread_join(tid, addr);
 }

@@ -4,7 +4,17 @@
 #include "kernel/riscv.h"
 #include "kernel/vm.h"
 #include "user/user.h"
+// Forward declaration of the actual system call
+extern void _exit(int) __attribute__((noreturn));
 
+// Debug wrapper for exit() to track when threads call exit
+int
+exit(int status)
+{
+  // Note: Can't use printf here due to forktest linking constraints
+  // Debug output will be in kernel via kexit()
+  _exit(status);  // Call the actual system call - this never returns
+}
 //
 // wrapper so that it's OK if main() does not call exit().
 //

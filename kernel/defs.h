@@ -9,6 +9,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct trapframe;
 
 // bio.c
 void            binit(void);
@@ -106,6 +107,7 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
 int             thread_create(void (*fn)(void));
+int             thread_join(int tid, uint64 addr);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -148,6 +150,13 @@ void            trapinithart(void);
 extern struct spinlock tickslock;
 void            prepare_return(void);
 uint64          usertrap(void);
+void            kerneltrap(void);
+
+// stacktrace.c
+void            kernel_stacktrace(void);
+void            user_stacktrace(pagetable_t, uint64, uint64);
+void            register_dump(struct trapframe*);
+void            debug_trap_full_analysis(struct trapframe*, uint64, uint64);
 
 // uart.c
 void            uartinit(void);

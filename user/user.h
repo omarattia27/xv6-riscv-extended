@@ -28,7 +28,7 @@ int msgget(int);
 int msgsnd(int, void*, int);
 int msgrcv(int, void*, int);
 int thread_create(void (*fn)(void));
-// int thread_join();
+int thread_join(int tid, int* status);
 // void thread_exit(void);
 
 
