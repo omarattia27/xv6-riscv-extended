@@ -27,6 +27,10 @@ int uptime(void);
 int msgget(int);
 int msgsnd(int, void*, int);
 int msgrcv(int, void*, int);
+int thread_create(void (*fn)(void));
+int thread_join(int tid, int* status);
+// void thread_exit(void);
+
 
 // ulib.c
 int stat(const char*, struct stat*);

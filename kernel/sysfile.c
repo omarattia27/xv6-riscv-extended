@@ -18,15 +18,27 @@
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
+// Caller must not hold fd_lock.
 static int
 argfd(int n, int *pfd, struct file **pf)
 {
   int fd;
   struct file *f;
+  struct proc *p = myproc();
 
   argint(n, &fd);
-  if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
+  if(fd < 0 || fd >= NOFILE)
     return -1;
+  
+  // Quick atomic read - file pointers are set atomically
+  // File has its own refcounting, so this is safe
+  acquire(&p->fd_lock);
+  f = p->ofile[fd];
+  release(&p->fd_lock);
+  
+  if(f == 0)
+    return -1;
+    
   if(pfd)
     *pfd = fd;
   if(pf)
@@ -42,12 +54,15 @@ fdalloc(struct file *f)
   int fd;
   struct proc *p = myproc();
 
+  acquire(&p->fd_lock);
   for(fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd] == 0){
       p->ofile[fd] = f;
+      release(&p->fd_lock);
       return fd;
     }
   }
+  release(&p->fd_lock);
   return -1;
 }
 
@@ -99,10 +114,15 @@ sys_close(void)
 {
   int fd;
   struct file *f;
+  struct proc *p = myproc();
 
   if(argfd(0, &fd, &f) < 0)
     return -1;
-  myproc()->ofile[fd] = 0;
+  
+  acquire(&p->fd_lock);
+  p->ofile[fd] = 0;
+  release(&p->fd_lock);
+  
   fileclose(f);
   return 0;
 }

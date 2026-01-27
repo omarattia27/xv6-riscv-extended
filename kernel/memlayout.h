@@ -45,7 +45,10 @@
 
 // map kernel stacks beneath the trampoline,
 // each surrounded by invalid guard pages.
-#define KSTACK(p) (TRAMPOLINE - ((p)+1)* 2*PGSIZE)
+// With 3 threads per process, each process needs 6*PGSIZE (3 stacks + 3 guards)
+#define KSTACK(p)  (TRAMPOLINE - ((p)*6 + 1)* PGSIZE - PGSIZE)   // Main thread (highest)
+#define KSTACK2(p) (TRAMPOLINE - ((p)*6 + 3)* PGSIZE - PGSIZE)   // Thread 2 (middle)
+#define KSTACK3(p) (TRAMPOLINE - ((p)*6 + 5)* PGSIZE - PGSIZE)   // Thread 3 (lowest)
 
 // User memory layout.
 // Address zero first:
@@ -53,7 +56,9 @@
 //   original data and bss
 //   fixed-size stack
 //   expandable heap
-//   ...
+//   ...*
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+#define TRAPFRAME2 (TRAMPOLINE - 2*PGSIZE)
+#define TRAPFRAME3 (TRAMPOLINE - 3*PGSIZE)

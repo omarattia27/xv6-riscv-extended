@@ -4,10 +4,12 @@ struct file;
 struct inode;
 struct pipe;
 struct proc;
+struct thread;
 struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct trapframe;
 
 // bio.c
 void            binit(void);
@@ -88,8 +90,11 @@ void            proc_freepagetable(pagetable_t, uint64);
 int             kkill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
+int             killed_thread(struct thread*);
+void            setkilled_thread(struct thread*);
 struct cpu*     mycpu(void);
 struct proc*    myproc();
+struct thread*  mythread();
 void            procinit(void);
 void            scheduler(void) __attribute__((noreturn));
 void            sched(void);
@@ -101,6 +106,8 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+int             thread_create(void (*fn)(void));
+int             thread_join(int tid, uint64 addr);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -142,6 +149,14 @@ void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            prepare_return(void);
+uint64          usertrap(void);
+void            kerneltrap(void);
+
+// stacktrace.c
+void            kernel_stacktrace(void);
+void            user_stacktrace(pagetable_t, uint64, uint64);
+void            register_dump(struct trapframe*);
+void            debug_trap_full_analysis(struct trapframe*, uint64, uint64);
 
 // uart.c
 void            uartinit(void);

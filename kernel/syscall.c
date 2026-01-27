@@ -33,20 +33,23 @@ fetchstr(uint64 addr, char *buf, int max)
 static uint64
 argraw(int n)
 {
-  struct proc *p = myproc();
+  struct thread *t = mythread();
+  struct proc *p = t->proc;
+  struct trapframe *tf = t->trapframe;
+  
   switch (n) {
   case 0:
-    return p->trapframe->a0;
+    return tf->a0;
   case 1:
-    return p->trapframe->a1;
+    return tf->a1;
   case 2:
-    return p->trapframe->a2;
+    return tf->a2;
   case 3:
-    return p->trapframe->a3;
+    return tf->a3;
   case 4:
-    return p->trapframe->a4;
+    return tf->a4;
   case 5:
-    return p->trapframe->a5;
+    return tf->a5;
   }
   panic("argraw");
   return -1;
@@ -104,6 +107,8 @@ extern uint64 sys_close(void);
 extern uint64 sys_msgget(void);
 extern uint64 sys_msgsnd(void);
 extern uint64 sys_msgrcv(void);
+extern uint64 sys_thread_create(void);
+extern uint64 sys_thread_join(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -132,6 +137,8 @@ static uint64 (*syscalls[])(void) = {
 [SYS_msgget]  sys_msgget,
 [SYS_msgsnd]  sys_msgsnd,
 [SYS_msgrcv]  sys_msgrcv,
+[SYS_thread_create] sys_thread_create,
+[SYS_thread_join] sys_thread_join,
 };
 
 void
@@ -139,15 +146,16 @@ syscall(void)
 {
   int num;
   struct proc *p = myproc();
+  struct thread *t = mythread();
 
-  num = p->trapframe->a7;
+  num = t->trapframe->a7;  // CRITICAL FIX: Use thread's trapframe, not process's
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
-    p->trapframe->a0 = syscalls[num]();
+    // and store its return value in THREAD's trapframe->a0
+    t->trapframe->a0 = syscalls[num]();
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);
-    p->trapframe->a0 = -1;
+    t->trapframe->a0 = -1;
   }
 }

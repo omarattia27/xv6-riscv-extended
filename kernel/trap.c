@@ -47,6 +47,7 @@ trapinithart(void)
 uint64
 usertrap(void)
 {
+
   int which_dev = 0;
 
   if((r_sstatus() & SSTATUS_SPP) != 0)
@@ -57,19 +58,73 @@ usertrap(void)
   w_stvec((uint64)kernelvec);  //DOC: kernelvec
 
   struct proc *p = myproc();
+  struct thread *t = mythread();
   
-  // save user program counter.
-  p->trapframe->epc = r_sepc();
+  // CRITICAL DEBUG: Track if wrong thread is being used for trap saving
+  static int debug_count = 0;
+  // if (debug_count < 10) {
+  //   printf("USERTRAP DEBUG %d: mythread()=%p slot=%d tid=%d, sepc=0x%lx\n", 
+  //          debug_count, t, t ? t->thread_slot : -1, t ? t->tid : -1, r_sepc());
+  //   debug_count++;
+  // }
+  
+  // Only debug Thread 1's first few traps to avoid output spam
+  static int thread1_trap_count = 0;
+  // if (t && t->thread_slot == 1 && thread1_trap_count < 5) {
+  //   printf("USERTRAP: thread slot %d (tid %d), sepc=0x%lx, trapframe=%p\n", 
+  //          t->thread_slot, t->tid, r_sepc(), t->trapframe);
+  //   thread1_trap_count++;
+  // }
+  
+  // Sanity check: we should always have a valid thread in usertrap
+  if(t == 0)
+    panic("usertrap: no thread");
+  
+  // Additional validation: check thread magic and trapframe
+  if(t->magic != 0xDEADBEEFCAFEBABE) {
+    printf("usertrap(): thread magic corrupted! magic=0x%lx\\n", t->magic);
+    panic("usertrap: thread corrupted");
+  }
+  
+  if(t->trapframe == 0) {
+    printf("usertrap(): thread trapframe is NULL!\\n");
+    panic("usertrap: no trapframe");
+  }
+  
+  // CRITICAL: Detect trapframe corruption before saving sepc
+  uint64 old_epc = t->trapframe->epc;
+  
+  // save user program counter to the THREAD's trapframe
+  // Each thread has its own trapframe, don't use p->trapframe for threads
+  t->trapframe->epc = r_sepc();
+  
+  // CRITICAL: Detect if we're about to execute kernel code in user space
+  // if(t->trapframe->epc >= 0x80000000) {
+  //   printf("CORRUPTION DETECTED: Thread %d trapframe->epc corrupted!\n", t->tid);
+  //   printf("  OLD EPC: 0x%lx\n", old_epc);
+  //   printf("  NEW EPC: 0x%lx (KERNEL ADDRESS!)\n", t->trapframe->epc);
+  //   printf("  sepc(): 0x%lx\n", r_sepc());
+  //   printf("  trapframe address: %p\n", t->trapframe);
+    
+  //   // Check if sepc itself is corrupted or if it's the trapframe
+  //   if(r_sepc() >= 0x80000000) {
+  //     printf("  -> sepc() register is corrupted!\n");
+  //   } else {
+  //     printf("  -> sepc() is OK, trapframe memory is corrupted!\n");
+  //   }
+  //   panic("Trapframe corruption detected");
+  // }
   
   if(r_scause() == 8){
     // system call
 
-    if(killed(p))
+    if(killed_thread(t))
       kexit(-1);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
-    p->trapframe->epc += 4;
+    // CRITICAL FIX: increment the THREAD's trapframe->epc
+    t->trapframe->epc += 4;
 
     // an interrupt will change sepc, scause, and sstatus,
     // so enable only now that we're done with those registers.
@@ -84,7 +139,7 @@ usertrap(void)
     // Check if address is valid (reject page 0 for null pointer safety)
     if(va < PGSIZE || va >= p->sz || va >= MAXVA) {
       printf("COW page fault: invalid address 0x%lx (sz=0x%lx)\n", va, p->sz);
-      setkilled(p);
+      setkilled_thread(t);
       goto killed;
     }
     
@@ -103,7 +158,7 @@ usertrap(void)
         // allocate new page
         uint64 mem = (uint64) kalloc();
         if(mem == 0) {
-          setkilled(p);
+          setkilled_thread(t);
           return 0;
         }
         // copy data from old page to new page
@@ -126,8 +181,16 @@ usertrap(void)
     } else if(vmfault(p->pagetable, r_stval(), 0) == 0) {
       // Not a COW page, and vmfault failed - can't handle this
       printf("usertrap(): unhandled page fault scause 0x%lx pid=%d\n", r_scause(), p->pid);
-      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      printf("            sepc=0x%lx (trapframe epc=0x%lx) stval=0x%lx\n", r_sepc(), t->trapframe->epc, r_stval());
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
+      setkilled_thread(t);
     } else {
       // vmfault succeeded, lazy allocation handled it
       lazy_alloc_faults++;
@@ -139,7 +202,15 @@ usertrap(void)
       // vmfault failed - invalid address
       printf("usertrap(): load page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Load page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
+      setkilled_thread(t);
     }
   } else if(r_scause() == 12) {
     // Instruction page fault - try lazy allocation
@@ -147,17 +218,25 @@ usertrap(void)
       // vmfault failed - invalid address  
       printf("usertrap(): instruction page fault, invalid address scause=0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
+      
+      // Trigger full analysis for debugging VM faults in thread stack range
+      // uint64 fault_addr = r_stval();
+      // if(fault_addr >= 16384 && fault_addr <= 40960) {
+      //   printf("CRITICAL: Instruction page fault in thread stack range - triggering full analysis\n");
+      //   debug_trap_full_analysis(t->trapframe, r_scause(), fault_addr);
+      // }
+      
+      setkilled_thread(t);
     }
   }
   else{
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
+    setkilled_thread(t);
   }
 
 killed:
-  if(killed(p))
+  if(killed_thread(t))
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
@@ -180,6 +259,15 @@ void
 prepare_return(void)
 {
   struct proc *p = myproc();
+  struct thread *t = mythread();
+
+  // CRITICAL DEBUG: Check if prepare_return is using wrong thread after yield
+  static int prep_debug_count = 0;
+  // if(prep_debug_count < 5) {
+  //   printf("PREPARE_RETURN DEBUG: CPU %d using thread %d (slot %d) trapframe=%p\n",
+  //          cpuid(), t ? t->tid : -1, t ? t->thread_slot : -1, t ? t->trapframe : 0);
+  //   prep_debug_count++;
+  // }
 
   // we're about to switch the destination of traps from
   // kerneltrap() to usertrap(). because a trap from kernel
@@ -190,12 +278,27 @@ prepare_return(void)
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
   w_stvec(trampoline_uservec);
 
-  // set up trapframe values that uservec will need when
-  // the process next traps into the kernel.
-  p->trapframe->kernel_satp = r_satp();         // kernel page table
-  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
-  p->trapframe->kernel_trap = (uint64)usertrap;
-  p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
+  // CRITICAL FIX: set up trapframe values using THREAD's trapframe
+  // Each thread must use its own trapframe, not the process's
+  t->trapframe->kernel_satp = r_satp();         // kernel page table
+  t->trapframe->kernel_sp = t->kstack + PGSIZE; // THREAD's kernel stack
+  t->trapframe->kernel_trap = (uint64)usertrap;
+  t->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
+
+  // CRITICAL: Set sscratch to point to this thread's trapframe virtual address
+  // The trampoline will use this to save/restore registers
+  // Use the thread's pre-calculated trapframe_va for consistency
+  if(t->trapframe_va == 0) {
+    panic("prepare_return: trapframe_va is zero");
+  }
+  w_sscratch(t->trapframe_va);
+  // Only debug Thread 1's first few sscratch sets to avoid spam
+  static int thread1_sscratch_count = 0; 
+  // if(t->thread_slot == 1 && thread1_sscratch_count < 5) {
+  //   printf("DEBUG: Set sscratch=0x%lx for thread slot %d (tid %d) trapframe_va=0x%lx\n", 
+  //          t->trapframe_va, t->thread_slot, t->tid, t->trapframe_va);
+  //   thread1_sscratch_count++;
+  // }
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
@@ -207,7 +310,8 @@ prepare_return(void)
   w_sstatus(x);
 
   // set S Exception Program Counter to the saved user pc.
-  w_sepc(p->trapframe->epc);
+  // CRITICAL FIX: Use THREAD's trapframe epc
+  w_sepc(t->trapframe->epc);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
@@ -219,6 +323,15 @@ kerneltrap()
   uint64 sepc = r_sepc();
   uint64 sstatus = r_sstatus();
   uint64 scause = r_scause();
+  uint64 stval = r_stval();
+  
+  // Debug: Check if tp register is corrupted
+  int hart_id = r_tp();
+  if(hart_id < 0 || hart_id >= NCPU) {
+    printf("CORRUPTION: tp register corrupted! tp=%d (should be 0-%d)\n", hart_id, NCPU-1);
+    printf("sepc=0x%lx scause=0x%lx stval=0x%lx\n", sepc, scause, stval);
+    panic("tp register corrupted");
+  }
   
   if((sstatus & SSTATUS_SPP) == 0)
     panic("kerneltrap: not from supervisor mode");
@@ -226,13 +339,63 @@ kerneltrap()
     panic("kerneltrap: interrupts enabled");
 
   if((which_dev = devintr()) == 0){
+    // Not a device interrupt - check if it's a page fault we can handle
+    if(scause == 13 || scause == 15) {
+      // Load page fault (13) or Store/AMO page fault (15)
+      // Print comprehensive fault information
+      printf("=== KERNEL PAGE FAULT DEBUG ===\n");
+      printf("Fault details: scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, sepc, stval);
+      printf("Fault type: %s\n", (scause == 13) ? "Load page fault" : "Store/AMO page fault");
+      printf("Hart ID: %d\n", hart_id);
+      
+      // Try to get source location
+      printf("Use this command to get source location:\n");
+      printf("riscv64-unknown-elf-addr2line -e kernel/kernel 0x%lx\n", sepc);
+      
+      // Get current process/thread info safely
+      struct proc *p = 0;
+      struct thread *t = 0;
+      
+      // Check if cpu structure is valid before using myproc/mythread
+      if(hart_id >= 0 && hart_id < NCPU) {
+        struct cpu *c = &cpus[hart_id];
+        p = c->proc;
+        t = c->thread;
+        printf("Current proc=%p thread=%p\n", p, t);
+        
+        if(t && t->magic == 0xDEADBEEFCAFEBABE) {
+          printf("Thread: state=%d tid=%d kstack=0x%lx\n", t->state, t->tid, t->kstack);
+          if(t->proc) {
+            printf("Process: pid=%d sz=0x%lx\n", t->proc->pid, t->proc->sz);
+          }
+        } else if(t) {
+          printf("Thread corrupted: magic=0x%lx (expected 0xDEADBEEFCAFEBABE)\n", t->magic);
+        }
+      }
+      
+      panic("kernel page fault");
+    }
+    
     // interrupt or trap from an unknown source
     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+    
+    // Try to get some context - but safely check cpu first
+    if(hart_id >= 0 && hart_id < NCPU) {
+      struct cpu *c = &cpus[hart_id];
+      struct proc *p = c->proc;
+      struct thread *t = c->thread;
+      printf("proc=%p thread=%p\n", p, t);
+      if(t && t->magic == 0xDEADBEEFCAFEBABE) {
+        printf("thread state=%d tid=%d\n", t->state, t->tid);
+      }
+    }
+    
     panic("kerneltrap");
   }
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
+  struct thread *t = mythread();
+  if(which_dev == 2 && t != 0)
     yield();
 
   // the yield() may have caused some traps to occur,

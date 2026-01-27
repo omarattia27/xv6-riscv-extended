@@ -76,7 +76,7 @@ sys_pause(void)
   acquire(&tickslock);
   ticks0 = ticks;
   while(ticks - ticks0 < n){
-    if(killed(myproc())){
+    if(killed_thread(mythread())){
       release(&tickslock);
       return -1;
     }
@@ -106,4 +106,31 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_thread_create(void)
+{
+  uint64 fn;
+  struct thread *t = mythread();
+  struct proc *p = myproc();
+  
+  // Thread creation system call
+  
+  argaddr(0, &fn);
+  
+  // printf("sys_thread_create: fn=0x%lx\n", fn);  // Removed to avoid mixed output
+  // printf("sys_thread_create: received fn=0x%lx\n", fn);  // Enable temporarily for debugging
+  
+  return thread_create((void (*)(void))fn);
+}
+
+uint64
+sys_thread_join(void)
+{
+  int tid;
+  uint64 addr;
+  argint(0, &tid);
+  argaddr(1, &addr);
+  return thread_join(tid, addr);
 }

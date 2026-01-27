@@ -70,11 +70,20 @@ kfree(void *pa)
     release(&refcount_lock);
     return;  // Don't free yet
   }
+  
+  // Check for double-free
+  if(refcount[(uint64)pa/PGSIZE] != 1) {
+    printf("kfree: double free detected! pa=%p refcount=%d\n", pa, refcount[(uint64)pa/PGSIZE]);
+    release(&refcount_lock);
+    panic("kfree: double free");
+  }
+  
   refcount[(uint64)pa/PGSIZE] = 0;
   release(&refcount_lock);
   
   // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+  // Use 0xAA instead of 0x01 to help debug
+  memset(pa, 0xAA, PGSIZE);
 
   r = (struct run*)pa;
 
@@ -94,8 +103,14 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
+    // Sanity check: next pointer should be either NULL or a valid kernel address
+    if(r->next != 0 && ((uint64)r->next < (uint64)end || (uint64)r->next >= PHYSTOP)) {
+      printf("kalloc: corrupted freelist! r=%p r->next=%p\n", r, r->next);
+      panic("kalloc: freelist corruption");
+    }
     kmem.freelist = r->next;
+  }
   release(&kmem.lock);
 
   if(r) {

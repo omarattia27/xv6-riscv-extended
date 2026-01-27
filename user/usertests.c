@@ -2726,7 +2726,7 @@ lazy_sbrk(char *s)
     p = sbrk(0);
   }
 
-  int n = TRAPFRAME-PGSIZE-(uint64)p;
+  int n = TRAPFRAME3-PGSIZE-(uint64)p;
 
   char *p1 = sys_sbrk(n, SBRK_LAZY);
   if (p1 < 0 || p1 != p) {
@@ -2735,8 +2735,8 @@ lazy_sbrk(char *s)
   }
 
   p = sys_sbrk(PGSIZE, SBRK_LAZY);
-  if (p < 0 || (uint64)p != TRAPFRAME-PGSIZE) {
-    printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
+  if (p < 0 || (uint64)p != TRAPFRAME3-PGSIZE) {
+    printf("sbrk(%d) returned %p, not expected TRAPFRAME3-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
 

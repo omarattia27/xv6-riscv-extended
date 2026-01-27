@@ -9,12 +9,13 @@ print "#include \"kernel/syscall.h\"\n";
 sub entry {
     my $prefix = "sys_";
     my $name = shift;
+    my $stub_name = shift || $name;  # Allow different stub name
     if ($name eq "sbrk") {
 	print ".global $prefix$name\n";
 	print "$prefix$name:\n";
     } else {
-	print ".global $name\n";
-	print "$name:\n";
+	print ".global $stub_name\n";
+	print "$stub_name:\n";
     }
     print " li a7, SYS_${name}\n";
     print " ecall\n";
@@ -22,7 +23,7 @@ sub entry {
 }
 	
 entry("fork");
-entry("exit");
+entry("exit", "_exit");  # Generate _exit stub for exit syscall
 entry("wait");
 entry("pipe");
 entry("read");
@@ -45,3 +46,5 @@ entry("uptime");
 entry("msgget");
 entry("msgsnd");
 entry("msgrcv");
+entry("thread_create");
+entry("thread_join");

@@ -23,3 +23,5 @@
 #define SYS_msgget 22
 #define SYS_msgsnd 23
 #define SYS_msgrcv 24
+#define SYS_thread_create 25
+#define SYS_thread_join 26

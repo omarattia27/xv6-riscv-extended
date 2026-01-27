@@ -29,12 +29,14 @@ uservec:
 
         # save user a0 in sscratch so
         # a0 can be used to get at TRAPFRAME.
-        csrw sscratch, a0
+        #csrw sscratch, a0
 
         # each process has a separate p->trapframe memory area,
         # but it's mapped to the same virtual address
         # (TRAPFRAME) in every process's user page table.
-        li a0, TRAPFRAME
+        # Get trapframe address from sscratch (set by kernel before sret)
+        csrrw a0, sscratch, a0 
+        #li a0, TRAPFRAME # OLD CODE
         
         # save the user registers in TRAPFRAME
         sd ra, 40(a0)
@@ -102,12 +104,19 @@ userret:
         # usertrap() returns here, with user satp in a0.
         # return from kernel to user.
 
+        # DEBUG: Save sepc before page table switch
+        csrr t1, sepc
+
         # switch to the user page table.
         sfence.vma zero, zero
         csrw satp, a0
         sfence.vma zero, zero
 
-        li a0, TRAPFRAME
+        # DEBUG: Check if sepc changed after page table switch
+        csrr t2, sepc
+
+        # Get trapframe address from sscratch (thread-specific)
+        csrr a0, sscratch
 
         # restore all but a0 from TRAPFRAME
         ld ra, 40(a0)
@@ -144,6 +153,10 @@ userret:
 	# restore user a0
         ld a0, 112(a0)
         
+        # DEBUG: For debugging Thread 1, save sepc to t0 for inspection
+        # This will show up in the register dump when Thread 1 traps
+        csrr t0, sepc
+        
         # return to user mode and user pc.
-        # usertrapret() set up sstatus and sepc.
+        # sepc should already be set correctly by threadret
         sret

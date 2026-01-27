@@ -21,6 +21,7 @@ struct context {
 // Per-CPU state.
 struct cpu {
   struct proc *proc;          // The process running on this cpu, or null.
+  struct thread *thread;      // The thread running on this cpu, or null.
   struct context context;     // swtch() here to enter scheduler().
   int noff;                   // Depth of push_off() nesting.
   int intena;                 // Were interrupts enabled before push_off()?
@@ -79,38 +80,76 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+#define NTHREAD 3 // Maximum number of threads per process
+
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
 struct proc {
-  struct spinlock lock;
+  struct spinlock lock;        // Protects process lifecycle (state, pid, xstate)
+  struct spinlock mem_lock;    // Protects address space (sz, pagetable modifications)
+  struct spinlock fd_lock;     // Protects file descriptor table (ofile[])
 
   // p->lock must be held when using these:
-  enum procstate state;        // Process state
-  void *chan;                  // If non-zero, sleeping on chan
-  int killed;                  // If non-zero, have been killed
+  enum procstate state;        // Process state (UNUSED, USED, ZOMBIE)
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
-
-  //int yielded;                 // If non-zero, process has yielded CPU this round
-  int cpu_ticks;               // Number of ticks process has run
-  int time_slices_left;             // Time slice allocated in the CPU during current round
-  int age_in_low_queue;        // Age of the process in the low priority queue
-  int age_in_high_queue;       // Age of the process in the high priority queue
-  int priority;                // Process priority
-  int in_queue;              // If non-zero, process is in a scheduling queue
-
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 
-  // these are private to the process, so p->lock need not be held.
-  uint64 kstack;               // Virtual address of kernel stack
+  // p->mem_lock must be held when modifying these:
   uint64 sz;                   // Size of process memory (bytes)
   pagetable_t pagetable;       // User page table
-  struct trapframe *trapframe; // data page for trampoline.S
-  struct context context;      // swtch() here to run process
+
+  // these are private to the process, no lock needed:
+  uint64 kstack;               // Virtual address of kernel stack (unused, threads have their own)
+  struct trapframe *trapframe; // data page for trampoline.S (thread 0)
+  struct trapframe *trapframe2; // trapframe for thread 1
+  struct trapframe *trapframe3; // trapframe for thread 2
+  struct context context;      // swtch() context (unused, threads have their own)
+  
+  // p->fd_lock must be held when modifying these:
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
+  
   char name[16];               // Process name (debugging)
+
+  // Threads within the process (allocated once, never freed)
+  struct thread *threads[NTHREAD]; // Threads of the process
+};
+
+// Per-thread state
+enum threadstate { T_UNUSED, T_USED, T_SLEEPING, T_RUNNABLE, T_RUNNING, T_ZOMBIE };
+struct thread {
+  struct spinlock lock;
+
+  // t->lock must be held when using these:
+  enum threadstate state;      // Thread state
+  void *chan;                  // If non-zero, sleeping on chan
+  int killed;                  // If non-zero, thread has been killed
+  int xstate;                  // Exit status to be returned to parent's thread_join
+  int tid;                     // Thread ID (global)
+  int thread_slot;             // Thread slot within process (0=main, 1=first thread, 2=second thread)
+
+  // Scheduling fields
+  int cpu_ticks;               // Number of ticks thread has run
+  int time_slices_left;        // Time slice allocated in the CPU during current round
+  int age_in_low_queue;        // Age of the thread in the low priority queue
+  int age_in_high_queue;       // Age of the thread in the high priority queue
+  int priority;                // Thread priority
+  int in_queue;                // If non-zero, thread is in a scheduling queue
+
+  // Thread execution context
+  struct context context;      // swtch() here to run thread
+  struct trapframe *trapframe; // per-thread trapframe (physical page)
+  uint64 trapframe_va;         // user VA of trapframe (TRAPFRAME/TRAPFRAME2/TRAPFRAME3)
+  uint64 kstack;               // Virtual address of thread's kernel stack
+  uint64 stack_base;           // User stack base address
+
+  // Parent process
+  struct proc *proc;           // Owning process
+  
+  // Magic number for detecting corruption
+  uint64 magic;                // Should always be 0xDEADBEEFCAFEBABE
 };
