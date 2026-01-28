@@ -94,6 +94,7 @@ struct proc {
   enum procstate state;        // Process state (UNUSED, USED, ZOMBIE)
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
+  int home_node;                // Home NUMA node ID
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
@@ -149,7 +150,7 @@ struct thread {
 
   // Parent process
   struct proc *proc;           // Owning process
-  
+
   // Magic number for detecting corruption
   uint64 magic;                // Should always be 0xDEADBEEFCAFEBABE
 };
