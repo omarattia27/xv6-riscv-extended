@@ -223,6 +223,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->home_node = p->pid; // Simple home node assignment based on pid
 
   // Threads are already allocated in procinit(), just reinitialize them
   for(int i = 0; i < NTHREAD; i++) {
@@ -863,7 +864,7 @@ kexit(int status)
   }
 
   // This is the main thread - exit the entire process
-  printf("kexit: main thread exiting, killing entire process\n");
+  //printf("kexit: main thread exiting, killing entire process\n");
 
   // Close all open files.
   acquire(&p->fd_lock);
@@ -1084,6 +1085,62 @@ void set_threading_initialized() {
   threading_initialized = 1;
 }
 
+struct thread *queue_get_numa_friendly_thread() {
+  // Placeholder for NUMA-aware scheduling logic
+  if(!threading_initialized)
+    return 0;
+    
+  struct proc *p;
+  struct thread *t;
+
+  //for priority levels 0 and 1
+  for(int priority = 0; priority <= 1; priority++) {
+    // Scan the queue for a thread matching the current CPU
+    acquire(&queue_lock);
+    int queue_size = (priority == 0) ? queue_size_0 : queue_size_1;
+    struct thread **queue = (priority == 0) ? queue_0 : queue_1;
+
+    for(p = proc; p < &proc[NPROC]; p++) {
+      // Skip unused processes to avoid unnecessary work
+      if(p->state == UNUSED)
+        continue;
+        
+      for(int i = 0; i < NTHREAD; i++) {
+        t = p->threads[i];
+        if(t == 0)
+          continue;
+          
+        // Skip threads whose lock is already locked to avoid double-acquire
+        if(t->lock.locked)
+          continue;
+          
+        acquire(&t->lock);
+        if (t->state != T_RUNNABLE) {
+          release(&t->lock);
+          continue;
+        }
+
+        // Check if thread's last_cpu matches current CPU
+        if(t->proc->home_node == cpuid()) {
+          // Found a NUMA-friendly thread
+          t->priority = -1; // Mark as not in queue
+          release(&t->lock);
+          release(&queue_lock);
+          // Remove from queue
+          struct thread *removed = queue_remove(t->tid, 0);
+          return t;
+        } else {
+          release(&t->lock);
+        }
+
+
+      }
+  }
+    release(&queue_lock);
+  }
+  return 0; // No NUMA-friendly thread found
+}
+
 void queue_update_priorities() {
   // Don't do queue management until threading is fully initialized
   if(!threading_initialized)
@@ -1218,7 +1275,13 @@ scheduler(void)
     int found = 0;
 
     loop_proc_and_update_queues();
-    t = queue_pop();  // Returns WITHOUT lock held
+
+    // we should adjust this function to find a thread with a NUMA locality match first
+    t = queue_get_numa_friendly_thread();
+    if(t == 0) {
+      t = queue_pop();
+    }
+    
     if (t != 0) {
       acquire(&t->lock);
       if(t->state == T_RUNNABLE) {
@@ -1228,34 +1291,8 @@ scheduler(void)
         t->state = T_RUNNING;
         c->thread = t;
         c->proc = t->proc;  // Also set proc for compatibility
-        // printf("SCHEDULER: CPU %d about to run thread %d, trapframe->epc=0x%lx\n", cpuid(), t->tid, t->trapframe->epc);
-        
-        // CRITICAL: Track Thread 1's trapframe corruption
-        // if(t->thread_slot == 1 && t->trapframe->epc != 0x1000) {
-        //   printf("CRITICAL: Thread 1 trapframe CORRUPTED! EPC=0x%lx (should be 0x1000)\n", t->trapframe->epc);
-        //   printf("  Thread 1 will execute wrong code!\n");
-        // }
-        
-        // CRITICAL: Debug Thread 1's first execution
-        static int thread1_first_run = 0;
-        // if(t->thread_slot == 1 && !thread1_first_run) {
-        //   printf("\\n=== CRITICAL: Thread 1 FIRST EXECUTION ===\\n");
-        //   printf("EPC: 0x%lx (should be 0x1000 for thread_func1)\\n", t->trapframe->epc);
-        //   printf("SP: 0x%lx\\n", t->trapframe->sp);
-        //   printf("RA: 0x%lx\\n", t->trapframe->ra);
-        //   printf("Thread slot: %d, TID: %d\\n", t->thread_slot, t->tid);
-        //   printf("Trapframe: %p\\n", t->trapframe);
-        //   printf("=== END Critical Thread 1 debug ===\\n\\n");
-        //   thread1_first_run = 1;
-        // }
-        
+
         swtch(&c->context, &t->context);
-        
-        // CRITICAL: Check if Thread 1's trapframe was corrupted during context switch
-        // if(t->thread_slot == 1 && t->trapframe->epc != 0x1000) {
-        //   printf("CRITICAL: Thread 1 trapframe corrupted DURING context switch! EPC=0x%lx\n", t->trapframe->epc);
-        //   printf("  Context switch corrupted Thread 1's execution state!\n");
-        // }
         
         if(t->state == T_RUNNING)
           panic("scheduler: thread still RUNNING after swtch");
