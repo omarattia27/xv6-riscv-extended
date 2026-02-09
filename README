@@ -26,10 +26,12 @@ xv6 was extended to support **multiple threads per process** (with a maximum of 
 ### Thread Model
 
 - Threads **share**:
+
   - address space (page table)
   - file descriptors
 
 - Threads have:
+
   - independent kernel stacks
   - independent execution contexts
 
@@ -141,8 +143,4 @@ These limitations are intentional.
 
 This project was built to gain hands-on experience with:
 - OS execution models
-- scheduling tradeoffs
-- virtual memory mechanisms
-- kernel design constraints
-
-It serves as a practical exploration of operating system internals beyond the base xv6 implementation.
+- scheduling tr
